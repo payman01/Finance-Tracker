@@ -20,7 +20,7 @@ jobs:
           submodules: true
 
       - name: Install API dependencies
-        run: npm ci
+        run: npm install
         working-directory: api
 
       - name: Deploy to Azure Static Web Apps
@@ -32,7 +32,7 @@ jobs:
           action: upload
           app_location: /
           api_location: api
-          output_location: /
+          output_location: ""
 
       - name: Print deployed URL
         run: echo "Deployed to ${{ steps.deploy.outputs.static_web_app_url }}"
