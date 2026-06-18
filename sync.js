@@ -3,20 +3,28 @@
 
   var API       = '/api/data';
   var STORE_KEY = 'fintrack_v2';
-  var SESSION_KEY = 'ft_cloud_synced';
+  var SYNCED_FLAG = 'ft_synced_v2'; // sessionStorage key
 
-  // Patch localStorage.setItem immediately so every app save also goes to cloud
-  var _origSetItem = Storage.prototype.setItem;
+  // ── Patch setItem immediately (runs before DOMContentLoaded) ─────────────
+  // This ensures every app save also goes to cloud.
+  var _set = Storage.prototype.setItem;
   Storage.prototype.setItem = function (key, value) {
-    _origSetItem.call(this, key, value);
+    _set.call(this, key, value);
     if (this === localStorage && key === STORE_KEY) {
-      pushToCloud(value);
+      stampAndPush(value);
     }
   };
 
-  function pushToCloud(storeJson) {
+  // Embed _savedAt inside the store before pushing.
+  // The timestamp lives WITH the data so comparisons are always reliable.
+  function stampAndPush(storeJson) {
     try {
       var store = JSON.parse(storeJson);
+      if (!store) return;
+      store._savedAt = Date.now();
+      // Write the stamp back to localStorage (bypasses patch to avoid recursion)
+      _set.call(localStorage, STORE_KEY, JSON.stringify(store));
+      // Fire-and-forget push to cloud
       fetch(API, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -25,96 +33,112 @@
     } catch (e) {}
   }
 
-  // On load: fetch cloud data once per session and reload if it's newer
+  // ── On page load: pull from cloud once per tab session ───────────────────
   async function syncOnLoad() {
-    if (sessionStorage.getItem(SESSION_KEY)) return;
-    sessionStorage.setItem(SESSION_KEY, '1');
+    // Same tab/session already synced — skip to avoid overwriting in-progress work
+    if (sessionStorage.getItem(SYNCED_FLAG)) return;
+    sessionStorage.setItem(SYNCED_FLAG, '1');
+
     try {
       var res = await fetch(API);
-      if (res.status === 401) {
-        // Not logged in — SWA will redirect to Microsoft login automatically
-        return;
-      }
+
+      // Not logged in — SWA config will redirect to Microsoft login for page
+      // navigation; here we just bail and let the status badge show sign-in UI
+      if (res.status === 401 || res.status === 302) return;
       if (!res.ok) return;
 
       var payload = await res.json();
+
       if (!payload || !payload.store) {
-        // No cloud data yet — push local data up so it's saved
-        var local = localStorage.getItem(STORE_KEY);
-        if (local) pushToCloud(local);
+        // Cloud is empty — push our local data up so it's saved
+        var localRaw = localStorage.getItem(STORE_KEY);
+        if (localRaw) stampAndPush(localRaw);
         return;
       }
 
-      // Cloud has data — check if it's newer than what's local
-      var cloudTime = payload.updatedAt ? new Date(payload.updatedAt).getTime() : 0;
-      var localTime = parseInt(localStorage.getItem('ft_last_save') || '0', 10);
+      var cloudSavedAt = Number(payload.store._savedAt) || 0;
+      var localSavedAt = 0;
+      try {
+        var localStore = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+        localSavedAt = Number((localStore && localStore._savedAt) || 0);
+      } catch (e) {}
 
-      if (cloudTime > localTime) {
-        _origSetItem.call(localStorage, STORE_KEY, JSON.stringify(payload.store));
-        localStorage.setItem('ft_last_save', String(cloudTime));
+      if (cloudSavedAt > localSavedAt) {
+        // Cloud has newer data — load it then reload so the app picks it up
+        _set.call(localStorage, STORE_KEY, JSON.stringify(payload.store));
         location.reload();
+      } else if (localSavedAt > cloudSavedAt) {
+        // Local is newer — push it up (e.g. was offline, now back online)
+        stampAndPush(localStorage.getItem(STORE_KEY));
       }
+      // Equal: already in sync, nothing to do
+
     } catch (e) {}
   }
 
-  // Track when we push so we can compare against cloud timestamp
-  var _origPush = pushToCloud;
-  pushToCloud = function (storeJson) {
-    localStorage.setItem('ft_last_save', String(Date.now()));
-    _origPush(storeJson);
-  };
-
-  // Minimal status badge (no sync code UI needed)
-  async function showStatus() {
+  // ── Status badge ─────────────────────────────────────────────────────────
+  async function renderBadge() {
     var badge = document.createElement('div');
     badge.style.cssText = [
       'position:fixed;bottom:14px;right:14px;z-index:9990',
-      'font:11px/1 system-ui,sans-serif;padding:5px 10px',
+      'font:11px/1 system-ui,sans-serif;padding:6px 12px',
       'background:#fff;border:1px solid #e5e7eb;border-radius:20px',
-      'box-shadow:0 2px 8px rgba(0,0,0,.08);color:#6b7280;cursor:default'
+      'box-shadow:0 2px 8px rgba(0,0,0,.1);cursor:default;user-select:none'
     ].join(';');
-    badge.title = 'Checking cloud sync...';
-    badge.textContent = '☁ syncing...';
+    badge.textContent = '☁ connecting…';
+    badge.style.color = '#9ca3af';
     document.body.appendChild(badge);
 
+    // Check auth status
     try {
-      // Get logged-in user info
       var meRes = await fetch('/.auth/me');
-      var me = await meRes.json();
-      var user = me.clientPrincipal;
+      var meData = await meRes.json();
+      var user = meData && meData.clientPrincipal;
 
       if (!user) {
-        badge.textContent = '☁ not signed in';
+        // Not logged in — show sign-in prompt
+        badge.textContent = '☁ Sign in to sync';
         badge.style.color = '#ef4444';
-        badge.title = 'Click to sign in';
         badge.style.cursor = 'pointer';
-        badge.onclick = function () { location.href = '/.auth/login/aad'; };
+        badge.style.borderColor = '#fca5a5';
+        badge.title = 'Click to sign in with Microsoft';
+        badge.onclick = function () { location.href = '/.auth/login/aad?post_login_redirect_uri=' + encodeURIComponent(location.pathname); };
         return;
       }
 
-      // Check last sync time
+      // Logged in — show last sync time
       var dataRes = await fetch(API);
       if (dataRes.ok) {
         var data = await dataRes.json();
-        if (data && data.updatedAt) {
-          var d = new Date(data.updatedAt);
-          badge.textContent = '☁ synced ' + d.toLocaleTimeString();
+        if (data && data.store && data.store._savedAt) {
+          var d = new Date(data.store._savedAt);
+          badge.textContent = '☁ synced ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
           badge.style.color = '#22c55e';
-          badge.title = 'Signed in as ' + (user.userDetails || user.userId) + ' · Last saved: ' + d.toLocaleString();
+          badge.title = 'Signed in as ' + (user.userDetails || user.userId) + '\nLast saved: ' + d.toLocaleString();
         } else {
           badge.textContent = '☁ signed in';
           badge.style.color = '#22c55e';
           badge.title = 'Signed in as ' + (user.userDetails || user.userId);
         }
       }
+
+      // Add manual pull button (long-press or right-click on badge to force pull)
+      badge.title += '\n\nClick to force pull latest from cloud';
+      badge.style.cursor = 'pointer';
+      badge.onclick = function () {
+        sessionStorage.removeItem(SYNCED_FLAG);
+        location.reload();
+      };
+
     } catch (e) {
       badge.textContent = '☁ offline';
       badge.style.color = '#9ca3af';
+      badge.title = 'Cannot reach sync server';
     }
   }
 
   document.addEventListener('DOMContentLoaded', function () {
     syncOnLoad();
-    setTimeout(showStatus, 600);
+    setTimeout(renderBadge, 800);
   });
 })();
