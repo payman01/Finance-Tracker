@@ -5,12 +5,16 @@
   var STORE_KEY  = 'fintrack_v2';
   var CHECKED    = 'ft_checked'; // sessionStorage — one cloud check per tab lifetime
 
+  // Block pushes until we know whether the cloud has newer data.
+  // This prevents seed data being pushed to cloud before the initial check completes.
+  var _pushReady = !!sessionStorage.getItem(CHECKED); // already checked this tab = ready immediately
+
   // ── Patch localStorage.setItem immediately ────────────────────────────────
   // Runs synchronously before DOMContentLoaded so every app save auto-pushes.
   var _set = Storage.prototype.setItem;
   Storage.prototype.setItem = function (key, value) {
     _set.call(this, key, value);
-    if (this === localStorage && key === STORE_KEY) {
+    if (this === localStorage && key === STORE_KEY && _pushReady) {
       push(value);
     }
   };
@@ -54,24 +58,34 @@
       return { error: 'API returned non-JSON (functions may not be deployed yet)' };
     }
 
-    if (!payload || !payload.store) {
-      // Cloud empty — push local data up
-      var localRaw = localStorage.getItem(STORE_KEY);
-      if (localRaw) push(localRaw);
-      return null;
-    }
-
-    var cloudSavedAt = Number(payload.store._savedAt) || 0;
+    var cloudSavedAt = Number(payload && payload.store && payload.store._savedAt) || 0;
     var localStore   = null;
     try { localStore = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) {}
     var localSavedAt = Number((localStore && localStore._savedAt) || 0);
 
+    if (!payload || !payload.store) {
+      // Cloud empty — push local data up so it's saved
+      if (localStore) push(JSON.stringify(localStore));
+      return null;
+    }
+
+    if (localSavedAt === 0) {
+      // No local data at all (new/private browser) — silently load cloud data
+      // then reload so the app reads the real data instead of its built-in seed data
+      _set.call(localStorage, STORE_KEY, JSON.stringify(payload.store));
+      return { silentReload: true };
+    }
+
     if (cloudSavedAt > localSavedAt) {
+      // Both devices have data, cloud is newer — show banner so user can decide
       return { newerStore: payload.store };
     }
+
     if (localSavedAt > cloudSavedAt) {
+      // Local is newer (e.g. made changes while offline) — push up
       push(localStorage.getItem(STORE_KEY));
     }
+
     return null;
   }
 
@@ -201,9 +215,25 @@
     var result = await checkCloud();
 
     if (result === 'unauthed') {
-      // Will be handled by the badge (sign-in prompt)
+      // Badge will show sign-in prompt
+    } else if (result && result.silentReload) {
+      // No local data existed — cloud data was written to localStorage, reload so app reads it
+      location.reload();
+      return;
     } else if (result && result.newerStore) {
+      // Both devices have data and cloud is newer — let user decide
       showUpdateBanner(result.newerStore);
+    }
+
+    // Cloud check done — allow pushes going forward.
+    // If the app saved anything while we were checking, push it now.
+    _pushReady = true;
+    var pending = localStorage.getItem(STORE_KEY);
+    if (pending && !result.silentReload) {
+      var pendingStore = null;
+      try { pendingStore = JSON.parse(pending); } catch (e) {}
+      // Only push if this local data has no _savedAt (was saved before we could stamp it)
+      if (pendingStore && !pendingStore._savedAt) push(pending);
     }
 
     setTimeout(renderBadge, 800);
