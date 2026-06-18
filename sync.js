@@ -172,6 +172,7 @@
       var meRes  = await fetch('/.auth/me');
       var meData = await meRes.json();
       var user   = meData && meData.clientPrincipal;
+      console.log('[sync] clientPrincipal:', JSON.stringify(user));
 
       if (!user) {
         badge.textContent  = '☁ Sign in to sync';
@@ -196,12 +197,14 @@
         badge.textContent = '☁ saved ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         badge.style.color = '#22c55e';
         badge.title = 'Signed in as ' + (user.userDetails || user.userId)
+          + '\nUser ID: ' + user.userId
           + '\nLast saved: ' + d.toLocaleString()
           + '\n\nTap to check for updates from other devices';
       } else {
         badge.textContent = '☁ signed in';
         badge.style.color = '#22c55e';
-        badge.title = 'Signed in as ' + (user.userDetails || user.userId);
+        badge.title = 'Signed in as ' + (user.userDetails || user.userId)
+          + '\nUser ID: ' + user.userId;
       }
 
       // Tap badge to manually pull latest from cloud
