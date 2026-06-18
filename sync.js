@@ -5,25 +5,45 @@
   var STORE_KEY  = 'fintrack_v2';
   var CHECKED    = 'ft_checked'; // sessionStorage — one cloud check per tab lifetime
 
-  // Block pushes until we know whether the cloud has newer data.
-  // This prevents seed data being pushed to cloud before the initial check completes.
-  var _pushReady = !!sessionStorage.getItem(CHECKED); // already checked this tab = ready immediately
+  // Block pushes until cloud check completes (prevents seed data racing to cloud).
+  var _pushReady = !!sessionStorage.getItem(CHECKED);
+
+  // Content fingerprint of the data loaded at startup (without _savedAt).
+  // Used to skip re-pushing unchanged data when the app re-saves on init.
+  var _lastPushedFp = (function () {
+    try {
+      var s = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+      if (s && s._savedAt) { delete s._savedAt; return JSON.stringify(s); }
+    } catch (e) {}
+    return null;
+  })();
+
+  function _fingerprint(store) {
+    var c = Object.assign({}, store);
+    delete c._savedAt;
+    return JSON.stringify(c);
+  }
 
   // ── Patch localStorage.setItem immediately ────────────────────────────────
-  // Runs synchronously before DOMContentLoaded so every app save auto-pushes.
   var _set = Storage.prototype.setItem;
   Storage.prototype.setItem = function (key, value) {
     _set.call(this, key, value);
     if (this === localStorage && key === STORE_KEY && _pushReady) {
-      push(value);
+      push(value, false);
     }
   };
 
-  // Embed _savedAt inside the store JSON so the timestamp travels with the data.
-  function push(storeJson) {
+  // Push store to cloud. pass force=true to bypass the unchanged-content guard.
+  function push(storeJson, force) {
     try {
       var store = JSON.parse(storeJson);
       if (!store) return;
+      var fp = _fingerprint(store);
+      if (!force && _lastPushedFp !== null && fp === _lastPushedFp) {
+        console.log('[sync] content unchanged — skipping push');
+        return;
+      }
+      _lastPushedFp = fp;
       store._savedAt = Date.now();
       _set.call(localStorage, STORE_KEY, JSON.stringify(store));
       console.log('[sync] push → PUT /api/data  _savedAt=' + store._savedAt);
@@ -68,7 +88,7 @@
 
     if (!payload || !payload.store) {
       console.log('[sync] cloud empty — pushing local data up (localSavedAt=' + localSavedAt + ')');
-      if (localStore) push(JSON.stringify(localStore));
+      if (localStore) push(JSON.stringify(localStore), true);
       return null;
     }
 
@@ -88,7 +108,7 @@
 
     if (localSavedAt > cloudSavedAt) {
       console.log('[sync] local is newer — pushing up');
-      push(localStorage.getItem(STORE_KEY));
+      push(localStorage.getItem(STORE_KEY), true);
     }
 
     return null;
@@ -127,11 +147,11 @@
       location.reload();
     };
 
-    // "Keep mine" — dismiss banner and push local data up to cloud
+    // "Keep mine" — dismiss banner and force-push local data to cloud
     document.getElementById('ft-keep').onclick = function () {
       bar.remove();
       var localRaw = localStorage.getItem(STORE_KEY);
-      if (localRaw) push(localRaw);
+      if (localRaw) push(localRaw, true);
     };
   }
 
