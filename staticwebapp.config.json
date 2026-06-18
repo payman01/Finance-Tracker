@@ -2,7 +2,25 @@
   "navigationFallback": {
     "rewrite": "/index.html"
   },
+  "routes": [
+    {
+      "route": "/.auth/*",
+      "allowedRoles": ["anonymous"]
+    },
+    {
+      "route": "/api/*",
+      "allowedRoles": ["authenticated"]
+    },
+    {
+      "route": "/*",
+      "allowedRoles": ["authenticated"]
+    }
+  ],
   "responseOverrides": {
+    "401": {
+      "redirect": "/.auth/login/aad",
+      "statusCode": 302
+    },
     "404": {
       "rewrite": "/index.html",
       "statusCode": 200
