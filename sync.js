@@ -32,43 +32,47 @@
   }
 
   // ── Check cloud once per tab session ─────────────────────────────────────
-  // Returns: null (nothing to do) | 'unauthed' | { newerStore: {...} }
-  async function checkCloud() {
-    if (sessionStorage.getItem(CHECKED)) return null;
+  // Returns: null | 'unauthed' | { newerStore } | { error: msg }
+  async function checkCloud(force) {
+    if (!force && sessionStorage.getItem(CHECKED)) return null;
     sessionStorage.setItem(CHECKED, '1');
 
-    try {
-      var res = await fetch(API);
+    var res;
+    try { res = await fetch(API); } catch (e) {
+      return { error: 'Network error: ' + e.message };
+    }
 
-      if (res.status === 401) return 'unauthed';
-      if (!res.ok) return null;
+    if (res.status === 401) return 'unauthed';
+    if (!res.ok) {
+      var body = '';
+      try { body = await res.text(); } catch (e) {}
+      return { error: 'API error ' + res.status + (body ? ': ' + body.slice(0, 120) : '') };
+    }
 
-      var payload = await res.json();
+    var payload;
+    try { payload = await res.json(); } catch (e) {
+      return { error: 'API returned non-JSON (functions may not be deployed yet)' };
+    }
 
-      if (!payload || !payload.store) {
-        // Nothing in cloud yet — push local data up
-        var localRaw = localStorage.getItem(STORE_KEY);
-        if (localRaw) push(localRaw);
-        return null;
-      }
-
-      var cloudSavedAt = Number(payload.store._savedAt) || 0;
-      var localStore   = null;
-      try { localStore = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) {}
-      var localSavedAt = Number((localStore && localStore._savedAt) || 0);
-
-      if (cloudSavedAt > localSavedAt) {
-        // Cloud is newer — return it so we can show a banner (never auto-apply)
-        return { newerStore: payload.store };
-      }
-
-      if (localSavedAt > cloudSavedAt) {
-        // Local is newer (e.g. was offline) — push it up
-        push(localStorage.getItem(STORE_KEY));
-      }
-
+    if (!payload || !payload.store) {
+      // Cloud empty — push local data up
+      var localRaw = localStorage.getItem(STORE_KEY);
+      if (localRaw) push(localRaw);
       return null;
-    } catch (e) { return null; }
+    }
+
+    var cloudSavedAt = Number(payload.store._savedAt) || 0;
+    var localStore   = null;
+    try { localStore = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) {}
+    var localSavedAt = Number((localStore && localStore._savedAt) || 0);
+
+    if (cloudSavedAt > localSavedAt) {
+      return { newerStore: payload.store };
+    }
+    if (localSavedAt > cloudSavedAt) {
+      push(localStorage.getItem(STORE_KEY));
+    }
+    return null;
   }
 
   // ── Banner: shown when cloud has newer data ───────────────────────────────
@@ -166,13 +170,20 @@
       badge.onclick = async function () {
         badge.textContent = '☁ checking…';
         badge.style.color = '#9ca3af';
-        sessionStorage.removeItem(CHECKED);
-        var result = await checkCloud();
-        sessionStorage.setItem(CHECKED, '1');
+        var result = await checkCloud(true);
         if (result && result.newerStore) {
           showUpdateBanner(result.newerStore);
-          badge.textContent = '☁ update available';
+          badge.textContent = '☁ update ready — see banner above';
           badge.style.color = '#f59e0b';
+        } else if (result && result.error) {
+          badge.textContent = '☁ sync error — tap for details';
+          badge.style.color = '#ef4444';
+          badge.title = result.error + '\n\nTest API directly: ' + location.origin + '/api/data';
+          console.error('[sync]', result.error);
+        } else if (result === 'unauthed') {
+          badge.textContent = '☁ Sign in to sync';
+          badge.style.color = '#ef4444';
+          badge.onclick = function () { location.href = '/.auth/login/aad'; };
         } else {
           badge.textContent = '☁ up to date';
           badge.style.color = '#22c55e';
