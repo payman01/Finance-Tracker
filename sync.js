@@ -25,14 +25,18 @@
       var store = JSON.parse(storeJson);
       if (!store) return;
       store._savedAt = Date.now();
-      // Write stamped copy back to localStorage without triggering patch again
       _set.call(localStorage, STORE_KEY, JSON.stringify(store));
+      console.log('[sync] push → PUT /api/data  _savedAt=' + store._savedAt);
       fetch(API, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ store: store })
-      }).catch(function () {});
-    } catch (e) {}
+      }).then(function (r) {
+        console.log('[sync] PUT response:', r.status);
+      }).catch(function (e) {
+        console.error('[sync] PUT failed:', e.message);
+      });
+    } catch (e) { console.error('[sync] push error:', e); }
   }
 
   // ── Check cloud once per tab session ─────────────────────────────────────
@@ -58,31 +62,32 @@
       return { error: 'API returned non-JSON (functions may not be deployed yet)' };
     }
 
-    var cloudSavedAt = Number(payload && payload.store && payload.store._savedAt) || 0;
     var localStore   = null;
     try { localStore = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) {}
     var localSavedAt = Number((localStore && localStore._savedAt) || 0);
 
     if (!payload || !payload.store) {
-      // Cloud empty — push local data up so it's saved
+      console.log('[sync] cloud empty — pushing local data up (localSavedAt=' + localSavedAt + ')');
       if (localStore) push(JSON.stringify(localStore));
       return null;
     }
 
+    var cloudSavedAt = Number(payload.store._savedAt) || 0;
+    console.log('[sync] cloudSavedAt=' + cloudSavedAt + '  localSavedAt=' + localSavedAt);
+
     if (localSavedAt === 0) {
-      // No local data at all (new/private browser) — silently load cloud data
-      // then reload so the app reads the real data instead of its built-in seed data
+      console.log('[sync] no local data — silently loading cloud data and reloading');
       _set.call(localStorage, STORE_KEY, JSON.stringify(payload.store));
       return { silentReload: true };
     }
 
     if (cloudSavedAt > localSavedAt) {
-      // Both devices have data, cloud is newer — show banner so user can decide
+      console.log('[sync] cloud is newer — showing banner');
       return { newerStore: payload.store };
     }
 
     if (localSavedAt > cloudSavedAt) {
-      // Local is newer (e.g. made changes while offline) — push up
+      console.log('[sync] local is newer — pushing up');
       push(localStorage.getItem(STORE_KEY));
     }
 
@@ -226,14 +231,19 @@
     }
 
     // Cloud check done — allow pushes going forward.
-    // If the app saved anything while we were checking, push it now.
     _pushReady = true;
-    var pending = localStorage.getItem(STORE_KEY);
-    if (pending && !result.silentReload) {
+    console.log('[sync] _pushReady = true');
+
+    // If the app wrote to localStorage during the cloud check (before pushes were allowed),
+    // the data won't have _savedAt yet — push it now so it reaches the cloud.
+    var pendingRaw = localStorage.getItem(STORE_KEY);
+    if (pendingRaw) {
       var pendingStore = null;
-      try { pendingStore = JSON.parse(pending); } catch (e) {}
-      // Only push if this local data has no _savedAt (was saved before we could stamp it)
-      if (pendingStore && !pendingStore._savedAt) push(pending);
+      try { pendingStore = JSON.parse(pendingRaw); } catch (e) {}
+      if (pendingStore && !pendingStore._savedAt) {
+        console.log('[sync] pushing pending data that has no _savedAt');
+        push(pendingRaw);
+      }
     }
 
     setTimeout(renderBadge, 800);
