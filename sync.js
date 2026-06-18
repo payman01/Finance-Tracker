@@ -1,23 +1,35 @@
 (function () {
   'use strict';
 
-  var API       = '/api/data';
-  var STORE_KEY = 'fintrack_v2';
-  var CHECKED   = 'ft_checked';  // sessionStorage — one cloud check per tab
-  var FP_KEY    = 'ft_sync_fp';  // localStorage — fingerprint of last-pushed content
+  var API          = '/api/data';
+  var STORE_KEY    = 'fintrack_v2';
+  var CHECKED      = 'ft_checked';   // sessionStorage — one cloud check per tab
+  var FP_KEY       = 'ft_sync_fp';   // localStorage — fingerprint of last-pushed content
+  var SAVED_AT_KEY = 'ft_saved_at';  // localStorage — timestamp of last push (kept separate
+                                     // so the app can't strip it when it re-saves the store)
+
+  // ── One-time migration: move _savedAt out of the store into its own key ──
+  (function migrate() {
+    try {
+      if (localStorage.getItem(SAVED_AT_KEY)) return; // already migrated
+      var s = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+      if (s && s._savedAt) {
+        localStorage.setItem(SAVED_AT_KEY, String(s._savedAt));
+      }
+    } catch (e) {}
+  })();
 
   // Block pushes until cloud check completes (prevents seed data racing to cloud).
   var _pushReady = !!sessionStorage.getItem(CHECKED);
 
-  // Last-pushed content fingerprint — read from dedicated key, NOT from the store.
-  // This key is only written by push(), so null means "never pushed this content".
+  // Last-pushed content fingerprint — only written by push(), never pre-loaded from store.
   var _lastPushedFp = (function () {
     try { return localStorage.getItem(FP_KEY) || null; } catch (e) { return null; }
   })();
 
   function _fingerprint(store) {
     var c = Object.assign({}, store);
-    delete c._savedAt;
+    delete c._savedAt; // strip in case it leaked in
     return JSON.stringify(c);
   }
 
@@ -31,7 +43,8 @@
   };
 
   // Push store to cloud.
-  // force=true bypasses the unchanged-content guard (explicit sync ops always push).
+  // We do NOT embed _savedAt into the store — it lives in SAVED_AT_KEY instead.
+  // force=true bypasses the unchanged-content guard.
   function push(storeJson, force) {
     try {
       var store = JSON.parse(storeJson);
@@ -43,13 +56,16 @@
       }
       _lastPushedFp = fp;
       try { _set.call(localStorage, FP_KEY, fp); } catch (e) {}
-      store._savedAt = Date.now();
-      _set.call(localStorage, STORE_KEY, JSON.stringify(store));
-      console.log('[sync] push → PUT /api/data  _savedAt=' + store._savedAt);
+      var savedAt = Date.now();
+      try { _set.call(localStorage, SAVED_AT_KEY, String(savedAt)); } catch (e) {}
+      // Send store to API with _savedAt embedded only for cloud comparison;
+      // we do NOT rewrite STORE_KEY here — the app owns that key.
+      var cloudPayload = Object.assign({}, store, { _savedAt: savedAt });
+      console.log('[sync] push → PUT /api/data  _savedAt=' + savedAt);
       fetch(API, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ store: store })
+        body: JSON.stringify({ store: cloudPayload })
       }).then(function (r) {
         console.log('[sync] PUT response:', r.status);
       }).catch(function (e) {
@@ -58,11 +74,15 @@
     } catch (e) { console.error('[sync] push error:', e); }
   }
 
-  // Write cloud data to localStorage AND pre-set fingerprint so the reload
-  // after this call won't re-push the same content with a new timestamp.
+  // Write cloud data to localStorage and update all sync metadata.
+  // Strips _savedAt from what we write to STORE_KEY so the app never sees it.
   function _applyCloudData(cloudStore) {
-    var fp = _fingerprint(cloudStore);
-    _set.call(localStorage, STORE_KEY, JSON.stringify(cloudStore));
+    var cloudSavedAt = cloudStore._savedAt || Date.now();
+    var storeOnly = Object.assign({}, cloudStore);
+    delete storeOnly._savedAt;
+    _set.call(localStorage, STORE_KEY, JSON.stringify(storeOnly));
+    _set.call(localStorage, SAVED_AT_KEY, String(cloudSavedAt));
+    var fp = _fingerprint(storeOnly);
     _set.call(localStorage, FP_KEY, fp);
     _lastPushedFp = fp;
   }
@@ -89,13 +109,13 @@
       return { error: 'API returned non-JSON (functions may not be deployed yet)' };
     }
 
-    var localStore = null;
-    try { localStore = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) {}
-    var localSavedAt = Number((localStore && localStore._savedAt) || 0);
+    // localSavedAt comes from SAVED_AT_KEY, not from inside the store.
+    var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
+    var localRaw = localStorage.getItem(STORE_KEY);
 
     if (!payload || !payload.store) {
       console.log('[sync] cloud empty — force-pushing local data (localSavedAt=' + localSavedAt + ')');
-      if (localStore) push(JSON.stringify(localStore), true);
+      if (localRaw) push(localRaw, true);
       return null;
     }
 
@@ -103,7 +123,7 @@
     console.log('[sync] cloudSavedAt=' + cloudSavedAt + '  localSavedAt=' + localSavedAt);
 
     if (localSavedAt === 0) {
-      console.log('[sync] no local data — silently loading cloud data and reloading');
+      console.log('[sync] no local save timestamp — silently loading cloud data');
       _applyCloudData(payload.store);
       return { silentReload: true };
     }
@@ -115,7 +135,7 @@
 
     if (localSavedAt > cloudSavedAt) {
       console.log('[sync] local is newer — pushing up');
-      push(localStorage.getItem(STORE_KEY), true);
+      if (localRaw) push(localRaw, true);
     }
 
     return null;
@@ -192,9 +212,8 @@
         return;
       }
 
-      var localStore = null;
-      try { localStore = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) {}
-      var savedAt = localStore && localStore._savedAt;
+      // savedAt is now in its own key, not inside the store.
+      var savedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
 
       if (savedAt) {
         var d = new Date(savedAt);
@@ -246,7 +265,7 @@
     var result = await checkCloud();
 
     if (result === 'unauthed') {
-      // Badge will show sign-in prompt
+      // badge handles this
     } else if (result && result.silentReload) {
       location.reload();
       return;
@@ -257,13 +276,12 @@
     _pushReady = true;
     console.log('[sync] _pushReady = true');
 
-    // If the app wrote seed data before pushes were allowed (no _savedAt yet), push it now.
-    var pendingRaw = localStorage.getItem(STORE_KEY);
-    if (pendingRaw) {
-      var pendingStore = null;
-      try { pendingStore = JSON.parse(pendingRaw); } catch (e) {}
-      if (pendingStore && !pendingStore._savedAt) {
-        console.log('[sync] pushing pending data with no _savedAt');
+    // If the app wrote to STORE_KEY before pushes were allowed (seed data with no
+    // saved timestamp yet), push it now so it reaches the cloud.
+    if (!localStorage.getItem(SAVED_AT_KEY)) {
+      var pendingRaw = localStorage.getItem(STORE_KEY);
+      if (pendingRaw) {
+        console.log('[sync] pushing pending data (no saved timestamp yet)');
         push(pendingRaw, true);
       }
     }
