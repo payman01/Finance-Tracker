@@ -1,0 +1,8 @@
+{
+  "name": "finance-tracker-api",
+  "version": "1.0.0",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@azure/cosmos": "^4.1.0"
+  }
+}
