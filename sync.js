@@ -404,4 +404,31 @@
 
     setTimeout(renderBadge, 600);
   });
+
+  // ── Flush on page unload ──────────────────────────────────────────────────
+  // If a PUT is in-flight when the user refreshes/navigates away, FP_KEY won't
+  // be updated (no PUT 200). On reload the data looks "unconfirmed" and may be
+  // overwritten. keepalive:true lets the browser complete the request after unload.
+  window.addEventListener('beforeunload', function () {
+    if (!_pushReady) return;
+    try {
+      var localRaw = localStorage.getItem(STORE_KEY);
+      if (!localRaw) return;
+      var store = JSON.parse(localRaw);
+      if (!store) return;
+      var fp = _fingerprint(store);
+      var confirmedFp = localStorage.getItem(FP_KEY); // only set after PUT 200
+      if (fp === confirmedFp) return; // cloud already confirmed — nothing to flush
+      var savedAt = Date.now();
+      _set.call(localStorage, SAVED_AT_KEY, String(savedAt));
+      var cloudPayload = Object.assign({}, store, { _savedAt: savedAt });
+      fetch(API, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ store: cloudPayload }),
+        keepalive: true // survives page unload
+      });
+      console.log('[sync] beforeunload flush — keepalive PUT sent');
+    } catch (e) {}
+  });
 })();
