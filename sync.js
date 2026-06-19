@@ -29,6 +29,26 @@
     try { return localStorage.getItem(FP_KEY) || null; } catch (e) { return null; }
   })();
 
+  // ── Startup diagnostics ────────────────────────────────────────────────────
+  (function diagStartup() {
+    try {
+      var raw = localStorage.getItem(STORE_KEY);
+      var fp  = localStorage.getItem(FP_KEY);
+      var confirmed = fp ? 'fp:' + fp.slice(0, 16) + '...' : 'null';
+      if (raw) {
+        var s = JSON.parse(raw);
+        var items = [].concat(
+          ((s.categories || {}).expenses || []).reduce(function(a,c){ return a.concat(c.items||[]); }, []),
+          ((s.categories || {}).income  || []).reduce(function(a,c){ return a.concat(c.items||[]); }, [])
+        );
+        console.log('[sync] startup: localStorage has ' + items.length + ' items, FP_KEY=' + confirmed);
+        console.log('[sync] startup: items=[' + items.map(function(i){return i.name;}).join(', ') + ']');
+      } else {
+        console.log('[sync] startup: localStorage empty, FP_KEY=' + confirmed);
+      }
+    } catch (e) {}
+  })();
+
   function _fingerprint(store) {
     var c = Object.assign({}, store);
     delete c._savedAt;
@@ -405,11 +425,8 @@
     setTimeout(renderBadge, 600);
   });
 
-  // ── Flush on page unload ──────────────────────────────────────────────────
-  // If a PUT is in-flight when the user refreshes/navigates away, FP_KEY won't
-  // be updated (no PUT 200). On reload the data looks "unconfirmed" and may be
-  // overwritten. keepalive:true lets the browser complete the request after unload.
-  window.addEventListener('beforeunload', function () {
+  // ── Flush helper: push if localStorage differs from confirmed FP_KEY ────────
+  function _flushIfNeeded(label) {
     if (!_pushReady) return;
     try {
       var localRaw = localStorage.getItem(STORE_KEY);
@@ -417,18 +434,34 @@
       var store = JSON.parse(localRaw);
       if (!store) return;
       var fp = _fingerprint(store);
-      var confirmedFp = localStorage.getItem(FP_KEY); // only set after PUT 200
-      if (fp === confirmedFp) return; // cloud already confirmed — nothing to flush
+      var confirmedFp = localStorage.getItem(FP_KEY);
+      if (fp === confirmedFp) return;
       var savedAt = Date.now();
       _set.call(localStorage, SAVED_AT_KEY, String(savedAt));
       var cloudPayload = Object.assign({}, store, { _savedAt: savedAt });
+      console.log('[sync] ' + label + ' flush — keepalive PUT');
       fetch(API, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ store: cloudPayload }),
-        keepalive: true // survives page unload
-      });
-      console.log('[sync] beforeunload flush — keepalive PUT sent');
+        keepalive: true
+      }).then(function(r) {
+        if (r.ok) {
+          try { _set.call(localStorage, FP_KEY, fp); } catch (e) {}
+          console.log('[sync] ' + label + ' flush PUT 200 ✓');
+        }
+      }).catch(function() {});
     } catch (e) {}
+  }
+
+  // ── Flush on page unload (keepalive survives the refresh) ────────────────
+  window.addEventListener('beforeunload', function () { _flushIfNeeded('beforeunload'); });
+
+  // ── Flush when tab is hidden (fires earlier than beforeunload) ────────────
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') _flushIfNeeded('visibilitychange');
   });
+
+  // ── Periodic flush every 30 s — catches any push that failed silently ────
+  setInterval(function () { _flushIfNeeded('interval'); }, 30000);
 })();
