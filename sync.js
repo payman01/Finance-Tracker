@@ -117,11 +117,17 @@
 
     var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
     var localRaw = localStorage.getItem(STORE_KEY);
-    console.log('[sync] checkCloud: localSavedAt=' + localSavedAt);
+    console.log('[sync] checkCloud: localSavedAt=' + localSavedAt + ' localRaw=' + (localRaw ? 'yes' : 'null'));
 
     if (!payload || !payload.store) {
-      console.log('[sync] cloud empty — force-pushing local data');
-      if (localRaw) push(localRaw, true);
+      // Cloud is empty. Only push if we have data with a confirmed save timestamp —
+      // prevents pushing seed/default data (from a fresh private session) to cloud.
+      if (localRaw && localSavedAt > 0) {
+        console.log('[sync] cloud empty — re-pushing local data (savedAt=' + localSavedAt + ')');
+        push(localRaw, true);
+      } else {
+        console.log('[sync] cloud empty — no confirmed local data yet, skipping push');
+      }
       return null;
     }
 
@@ -129,9 +135,27 @@
     console.log('[sync] cloudSavedAt=' + cloudSavedAt + '  localSavedAt=' + localSavedAt);
 
     if (localSavedAt === 0) {
-      console.log('[sync] no local timestamp — loading cloud data silently');
-      _applyCloudData(payload.store);
-      return { silentReload: true };
+      if (!localRaw) {
+        // Truly empty local storage: silently load cloud data
+        console.log('[sync] empty local — silently loading cloud data');
+        _applyCloudData(payload.store);
+        return { silentReload: true };
+      }
+      // Local has data (app-initialised seed) but no confirmed save timestamp.
+      // Compare content: if identical to cloud, just sync the metadata silently.
+      // If different (user may have already typed something), show banner — never
+      // silently overwrite because that would wipe data entered before the GET returned.
+      try {
+        var localFp = _fingerprint(JSON.parse(localRaw));
+        var cloudFp = _fingerprint(payload.store);
+        if (localFp === cloudFp) {
+          console.log('[sync] same content as cloud — syncing metadata silently');
+          _applyCloudData(payload.store);
+          return { silentReload: true };
+        }
+      } catch (e) {}
+      console.log('[sync] local content differs from cloud (no timestamp) — showing banner');
+      return { newerStore: payload.store };
     }
 
     if (cloudSavedAt > localSavedAt) {
