@@ -83,7 +83,8 @@
       fetch(API, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ store: cloudPayload })
+        body: JSON.stringify({ store: cloudPayload }),
+        keepalive: true  // survives tab close / refresh so data reaches Cosmos
       }).then(function (r) {
         if (r.ok) {
           // Only persist fingerprint after confirmed cloud write
@@ -412,11 +413,16 @@
       // Cloud empty, up to date, or API error — safe to enable pushes.
       _pushReady = true;
       console.log('[sync] _pushReady = true');
-      // Force push if we have local data but no confirmed cloud save yet.
-      if (!localStorage.getItem(SAVED_AT_KEY)) {
+      // Force push only when SAVED_AT_KEY is missing AND FP_KEY exists.
+      // FP_KEY is only set after a confirmed PUT 200, so its presence proves
+      // this is real user data, not seed data from a fresh Private session.
+      // Without this guard, a new Private tab whose GET fires before Cosmos
+      // processes the previous session's keepalive PUT would push blank seed
+      // data to cloud, overwriting the real data.
+      if (!localStorage.getItem(SAVED_AT_KEY) && localStorage.getItem(FP_KEY)) {
         var pendingRaw = localStorage.getItem(STORE_KEY);
         if (pendingRaw) {
-          console.log('[sync] no saved timestamp — force-pushing local data');
+          console.log('[sync] SAVED_AT_KEY missing but FP_KEY set — force-pushing real data');
           push(pendingRaw, true);
         }
       }
