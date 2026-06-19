@@ -203,6 +203,8 @@
     };
     document.getElementById('ft-keep').onclick = function () {
       bar.remove();
+      _pushReady = true; // conflict resolved — enable auto-push going forward
+      console.log('[sync] user kept local changes — _pushReady = true');
       var localRaw = localStorage.getItem(STORE_KEY);
       if (localRaw) push(localRaw, true);
     };
@@ -376,23 +378,27 @@
     var result = await checkCloud();
 
     if (result === 'unauthed') {
-      // badge/profile will show sign-in
+      _pushReady = true;
+      console.log('[sync] _pushReady = true (unauthed)');
     } else if (result && result.silentReload) {
       location.reload();
       return;
     } else if (result && result.newerStore) {
+      // Cloud has newer data — show banner but do NOT enable pushes yet and do NOT
+      // force-push seed data. Banner handlers set _pushReady when conflict is resolved.
       showUpdateBanner(result.newerStore);
-    }
-
-    _pushReady = true;
-    console.log('[sync] _pushReady = true');
-
-    // Force push if we have local data but no confirmed cloud save yet.
-    if (!localStorage.getItem(SAVED_AT_KEY)) {
-      var pendingRaw = localStorage.getItem(STORE_KEY);
-      if (pendingRaw) {
-        console.log('[sync] no saved timestamp — force-pushing local data');
-        push(pendingRaw, true);
+      console.log('[sync] banner shown — _pushReady stays false until user resolves conflict');
+    } else {
+      // Cloud empty, up to date, or API error — safe to enable pushes.
+      _pushReady = true;
+      console.log('[sync] _pushReady = true');
+      // Force push if we have local data but no confirmed cloud save yet.
+      if (!localStorage.getItem(SAVED_AT_KEY)) {
+        var pendingRaw = localStorage.getItem(STORE_KEY);
+        if (pendingRaw) {
+          console.log('[sync] no saved timestamp — force-pushing local data');
+          push(pendingRaw, true);
+        }
       }
     }
 
