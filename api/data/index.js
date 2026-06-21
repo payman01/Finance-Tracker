@@ -47,11 +47,7 @@ module.exports = async function (context, req) {
 
     if (req.method === 'GET') {
       try {
-        // Strong consistency: every GET sees all committed writes regardless of
-        // which Function instance handled the preceding PUT. Session consistency
-        // (the account default) only works within a single CosmosClient session,
-        // so cross-instance reads silently returned stale/empty data.
-        const { resource } = await c.item(userId, userId).read({ consistencyLevel: 'Strong' });
+        const { resource } = await c.item(userId, userId).read();
         context.res = {
           status: 200,
           headers: HEADERS,
