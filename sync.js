@@ -189,16 +189,16 @@
     console.log('[sync] cloudSavedAt=' + cloudSavedAt + '  localSavedAt=' + localSavedAt);
 
     if (localSavedAt === 0) {
-      if (!localRaw) {
-        // Truly empty local storage: silently load cloud data
-        console.log('[sync] empty local — silently loading cloud data');
+      if (!localRaw || !localStorage.getItem(FP_KEY)) {
+        // No confirmed save from this browser (FP_KEY is only written after PUT 200).
+        // Local content is either empty or app-initialised seed data — cloud wins.
+        // This covers every new Private session: no banner, data just loads.
+        console.log('[sync] localSavedAt=0, no FP_KEY — silently loading cloud data');
         _applyCloudData(payload.store);
         return { silentReload: true };
       }
-      // Local has data (app-initialised seed) but no confirmed save timestamp.
-      // Compare content: if identical to cloud, just sync the metadata silently.
-      // If different (user may have already typed something), show banner — never
-      // silently overwrite because that would wipe data entered before the GET returned.
+      // FP_KEY is set but SAVED_AT_KEY was lost. Compare content so we don't
+      // silently discard data the user typed between app init and checkCloud.
       try {
         var localFp = _fingerprint(JSON.parse(localRaw));
         var cloudFp = _fingerprint(payload.store);
