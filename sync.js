@@ -29,6 +29,9 @@
     try { return localStorage.getItem(FP_KEY) || null; } catch (e) { return null; }
   })();
 
+  var _badge = null;              // DOM node reference for live badge updates
+  var _hasUnsavedChanges = false; // true between push() start and PUT 200
+
   // ── Startup diagnostics ────────────────────────────────────────────────────
   (function diagStartup() {
     try {
@@ -55,6 +58,12 @@
     return JSON.stringify(c);
   }
 
+  function _updateBadge(text, color) {
+    if (!_badge) return;
+    _badge.textContent = text;
+    _badge.style.color = color || '#9ca3af';
+  }
+
   // ── Patch localStorage.setItem immediately ────────────────────────────────
   var _set = Storage.prototype.setItem;
   Storage.prototype.setItem = function (key, value) {
@@ -76,6 +85,8 @@
         return;
       }
       _lastPushedFp = fp; // optimistically block duplicates in-flight
+      _hasUnsavedChanges = true;
+      _updateBadge('☁ saving…', '#f59e0b'); // amber while in-flight
       var savedAt = Date.now();
       try { _set.call(localStorage, SAVED_AT_KEY, String(savedAt)); } catch (e) {}
       var cloudPayload = Object.assign({}, store, { _savedAt: savedAt });
@@ -89,13 +100,18 @@
         if (r.ok) {
           // Only persist fingerprint after confirmed cloud write
           try { _set.call(localStorage, FP_KEY, fp); } catch (e) {}
+          _hasUnsavedChanges = false;
+          var d = new Date();
+          _updateBadge('☁ saved ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), '#22c55e');
           console.log('[sync] PUT 200 ✓');
         } else {
           _lastPushedFp = null; // allow retry
+          _updateBadge('⚠ save failed — will retry', '#ef4444');
           console.error('[sync] PUT failed status:', r.status);
         }
       }).catch(function (e) {
         _lastPushedFp = null; // allow retry on network error
+        _updateBadge('⚠ offline — will retry', '#9ca3af');
         console.error('[sync] PUT network error:', e.message);
       });
     } catch (e) { console.error('[sync] push error:', e); }
@@ -141,13 +157,25 @@
     console.log('[sync] checkCloud: localSavedAt=' + localSavedAt + ' localRaw=' + (localRaw ? 'yes' : 'null'));
 
     if (!payload || !payload.store) {
-      // Cloud is empty. Only push if we have data with a confirmed save timestamp —
-      // prevents pushing seed/default data (from a fresh private session) to cloud.
+      // Cloud appears empty. This can be Cosmos eventual-consistency lag: the previous
+      // session's keepalive PUT landed in Cosmos but hasn't replicated yet when this
+      // GET fires. Wait 1.5 s and retry once before concluding the cloud is truly empty.
+      console.log('[sync] cloud appears empty — waiting 1.5 s for Cosmos consistency…');
+      await new Promise(function (r) { setTimeout(r, 1500); });
+      try {
+        var r2 = await fetch(API);
+        if (r2.ok) { try { payload = await r2.json(); } catch (e) {} }
+      } catch (e) {}
+    }
+
+    if (!payload || !payload.store) {
+      // Still empty after retry — genuinely empty or unreachable.
+      // Only push if we have a confirmed save timestamp (real user data, not seed data).
       if (localRaw && localSavedAt > 0) {
-        console.log('[sync] cloud empty — re-pushing local data (savedAt=' + localSavedAt + ')');
+        console.log('[sync] cloud empty after retry — re-pushing local data (savedAt=' + localSavedAt + ')');
         push(localRaw, true);
       } else {
-        console.log('[sync] cloud empty — no confirmed local data yet, skipping push');
+        console.log('[sync] cloud empty after retry — no confirmed local data, skipping push');
       }
       return null;
     }
@@ -224,10 +252,17 @@
     };
     document.getElementById('ft-keep').onclick = function () {
       bar.remove();
-      _pushReady = true; // conflict resolved — enable auto-push going forward
+      _pushReady = true;
       console.log('[sync] user kept local changes — _pushReady = true');
-      var localRaw = localStorage.getItem(STORE_KEY);
-      if (localRaw) push(localRaw, true);
+      // Only push if this browser has a confirmed save timestamp.
+      // A fresh Private session has localSavedAt = 0, meaning the "local data" is
+      // just the app's default seed state. Pushing it would overwrite real cloud data.
+      if (localStorage.getItem(SAVED_AT_KEY)) {
+        var localRaw = localStorage.getItem(STORE_KEY);
+        if (localRaw) push(localRaw, true);
+      } else {
+        console.log('[sync] fresh session — not pushing seed data on Keep; cloud data preserved');
+      }
     };
   }
 
@@ -331,6 +366,7 @@
     badge.textContent = '☁ connecting…';
     badge.style.color = '#9ca3af';
     document.body.appendChild(badge);
+    _badge = badge; // expose for real-time updates from push()
 
     try {
       var meRes  = await fetch('/.auth/me');
@@ -461,7 +497,16 @@
   }
 
   // ── Flush on page unload (keepalive survives the refresh) ────────────────
-  window.addEventListener('beforeunload', function () { _flushIfNeeded('beforeunload'); });
+  window.addEventListener('beforeunload', function (e) {
+    _flushIfNeeded('beforeunload');
+    // If a PUT is still in-flight, show the browser's generic
+    // "Leave site? Changes may not be saved." dialog. This buys an extra
+    // second for the keepalive request to reach Cosmos before the tab closes.
+    if (_hasUnsavedChanges) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
+  });
 
   // ── Flush when tab is hidden (fires earlier than beforeunload) ────────────
   document.addEventListener('visibilitychange', function () {
