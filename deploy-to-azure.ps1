@@ -1,208 +1,265 @@
 # ============================================================
-#  Finance Tracker — Full Azure + GitHub Deployment Script
+#  Finance Tracker — Azure + GitHub Deployment Script
 #  Run with: pwsh ./deploy-to-azure.ps1
-#  Prerequisites installed automatically by this script.
 # ============================================================
 
-# ── Config — edit these three variables ─────────────────────
-$GITHUB_USERNAME   = "payman01"   # e.g. "paymanafshari"
-$REPO_NAME         = "finance-tracker"
-$AZURE_LOCATION    = "eastus"                 # nearest Azure region
+# ── Config ──────────────────────────────────────────────────
+$GITHUB_USERNAME = "payman01"
+$REPO_NAME       = "finance-tracker"
+$AZURE_LOCATION  = "eastus2"
 # ────────────────────────────────────────────────────────────
 
-$RESOURCE_GROUP    = "rg-finance-tracker"
-$APP_NAME          = "swa-finance-tracker-$(Get-Random -Maximum 9999)"
+$RESOURCE_GROUP = "rg-finance-tracker"
+$APP_NAME       = "swa-finance-tracker-$(Get-Random -Maximum 9999)"
 
-# Helpers
 function Log($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
-function Err($msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+function Err($msg) { Write-Host "`nERROR: $msg" -ForegroundColor Red; exit 1 }
 
 # ============================================================
-# STEP 1 — Install prerequisites
+# STEP 1 — Prerequisites
 # ============================================================
 Log "Checking prerequisites..."
 
-# Always ensure Homebrew bin dirs are in PATH for this session
-$env:PATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$env:PATH"
-
-# ── Xcode Command Line Tools (required for git and Homebrew) ──
-/usr/bin/xcode-select -p 2>/dev/null | Out-Null
+# ── Xcode Command Line Tools ──
+/usr/bin/xcode-select -p 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    Log "Installing Xcode Command Line Tools via softwareupdate..."
+    Log "Installing Xcode Command Line Tools..."
     /usr/bin/touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-    $cltPkg = softwareupdate -l 2>&1 |
+    $cltPkg = (softwareupdate -l 2>&1) |
         Select-String 'Command Line Tools for Xcode' |
         ForEach-Object { ($_ -replace '.*\* Label: ', '').Trim() } |
         Select-Object -Last 1
     if ($cltPkg) {
-        Write-Host "  Installing: $cltPkg" -ForegroundColor Yellow
         softwareupdate --install $cltPkg --verbose
-        if ($LASTEXITCODE -ne 0) { Err "CLT install failed. See manual steps below." }
+        if ($LASTEXITCODE -ne 0) { Err "CLT install failed. Install Xcode from the App Store then re-run." }
     } else {
         /bin/rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
-        Write-Host ""
-        Write-Host "  *** MANUAL STEP REQUIRED ***" -ForegroundColor Red
-        Write-Host "  1. Open the App Store and install 'Xcode' (free), OR" -ForegroundColor Yellow
-        Write-Host "  2. Download CLT from: https://developer.apple.com/download/all/" -ForegroundColor Yellow
-        Write-Host "  Then re-run this script." -ForegroundColor Yellow
+        Write-Host "`n  Install Xcode from the App Store then re-run." -ForegroundColor Red
         exit 1
     }
     /bin/rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
 }
 Write-Host "  Xcode CLT : OK" -ForegroundColor Green
 
-# ── Homebrew ──
-if (-not (Get-Command brew -ErrorAction SilentlyContinue)) {
+# ── Homebrew — find by file path, not by PATH ──
+$BREW = $null
+foreach ($candidate in @("/opt/homebrew/bin/brew", "/usr/local/bin/brew")) {
+    if (Test-Path $candidate) { $BREW = $candidate; break }
+}
+
+if (-not $BREW) {
     Log "Installing Homebrew..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    if ($LASTEXITCODE -ne 0) { Err "Homebrew installation failed." }
-    $env:PATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$env:PATH"
-    Write-Host "  Homebrew installed." -ForegroundColor Green
+    foreach ($candidate in @("/opt/homebrew/bin/brew", "/usr/local/bin/brew")) {
+        if (Test-Path $candidate) { $BREW = $candidate; break }
+    }
+    if (-not $BREW) { Err "Homebrew installed but binary not found at /opt/homebrew/bin/brew or /usr/local/bin/brew." }
 }
+
+$BREW_BIN = Split-Path $BREW -Parent          # e.g. /opt/homebrew/bin
+$env:PATH = "${BREW_BIN}:$env:PATH"
+Write-Host "  Homebrew  : $BREW" -ForegroundColor Green
 
 # ── Azure CLI ──
-if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-    Log "Installing Azure CLI via Homebrew..."
-    brew install azure-cli
-    if ($LASTEXITCODE -ne 0) { Err "Azure CLI installation failed." }
-    $env:PATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$env:PATH"
+$AZ = Join-Path $BREW_BIN "az"
+if (-not (Test-Path $AZ)) {
+    Log "Installing Azure CLI..."
+    & $BREW install azure-cli
+    if ($LASTEXITCODE -ne 0) { Err "Azure CLI install failed." }
 }
+Write-Host "  Azure CLI : $(& $AZ version --query '\"azure-cli\"' -o tsv)" -ForegroundColor Green
 
 # ── GitHub CLI ──
-if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-    Log "Installing GitHub CLI via Homebrew..."
-    brew install gh
-    if ($LASTEXITCODE -ne 0) { Err "GitHub CLI installation failed." }
-    $env:PATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$env:PATH"
+$GH = Join-Path $BREW_BIN "gh"
+if (-not (Test-Path $GH)) {
+    Log "Installing GitHub CLI..."
+    & $BREW install gh
+    if ($LASTEXITCODE -ne 0) { Err "GitHub CLI install failed." }
 }
-
-Write-Host "  Azure CLI : $(az version --query '\"azure-cli\"' -o tsv)" -ForegroundColor Green
-Write-Host "  GitHub CLI: $(gh --version | Select-Object -First 1)" -ForegroundColor Green
+Write-Host "  GitHub CLI: $(& $GH --version | Select-Object -First 1)" -ForegroundColor Green
 Write-Host "  git       : $(git --version)" -ForegroundColor Green
 
 # ============================================================
-# STEP 2 — Authenticate Azure & GitHub
+# STEP 2 — Authenticate
 # ============================================================
 Log "Logging in to Azure (browser will open)..."
-az login --output none
+& $AZ login --output none
 if ($LASTEXITCODE -ne 0) { Err "Azure login failed." }
-
-$SUBSCRIPTION_ID = az account show --query id -o tsv
+$SUBSCRIPTION_ID = & $AZ account show --query id -o tsv
 Write-Host "  Subscription: $SUBSCRIPTION_ID" -ForegroundColor Green
 
-Log "Logging in to GitHub (browser will open)..."
-gh auth login --hostname github.com --git-protocol https --web
-if ($LASTEXITCODE -ne 0) { Err "GitHub login failed." }
+Log "GitHub authentication via Personal Access Token..."
+Write-Host ""
+Write-Host "  Create a PAT at: https://github.com/settings/tokens/new" -ForegroundColor Yellow
+Write-Host "  Required scopes: repo, workflow, read:org" -ForegroundColor Yellow
+Write-Host ""
+$GH_TOKEN = Read-Host "  Paste your GitHub Personal Access Token here"
+if (-not $GH_TOKEN) { Err "No token provided." }
+
+$GH_TOKEN | & $GH auth login --hostname github.com --git-protocol https --with-token
+if ($LASTEXITCODE -ne 0) { Err "GitHub login failed. Ensure token has repo, workflow, read:org scopes." }
+Write-Host "  GitHub token: accepted" -ForegroundColor Green
 
 # ============================================================
-# STEP 3 — Create GitHub Repository (main + dev branches)
+# STEP 3 — GitHub repo + branches
 # ============================================================
 Log "Creating GitHub repository '$REPO_NAME'..."
-
-gh repo create "$GITHUB_USERNAME/$REPO_NAME" `
+& $GH repo create "$GITHUB_USERNAME/$REPO_NAME" `
     --public `
-    --description "Finance Tracker — deployed to Azure Static Web Apps" 2>/dev/null
+    --description "Finance Tracker deployed to Azure Static Web Apps" 2>$null
 
-# Init git in the project folder and push to dev first
-$PROJECT_DIR = $PSScriptRoot
+Push-Location $PSScriptRoot
 
-Push-Location $PROJECT_DIR
-git init -b main 2>/dev/null
-git remote remove origin 2>/dev/null
-git remote add origin "https://github.com/$GITHUB_USERNAME/$REPO_NAME.git"
+git checkout main 2>$null
+git branch -D dev 2>$null
+git init -b main 2>$null
+git remote remove origin 2>$null
+git remote add origin "https://$GH_TOKEN@github.com/$GITHUB_USERNAME/$REPO_NAME.git"
 
-Log "Pushing initial code to 'dev' branch..."
-git add .
-git commit -m "Initial commit — Finance Tracker static web app"
+git add index.html staticwebapp.config.json .github/
+if (git status --porcelain) {
+    git commit -m "Initial commit: Finance Tracker static web app"
+} else {
+    Write-Host "  Nothing new to commit — using existing HEAD." -ForegroundColor Yellow
+}
 
-git checkout -b dev
-git push -u origin dev
+Log "Pushing to 'dev' branch..."
+git checkout -b dev 2>$null
+git push -u origin dev --force
 if ($LASTEXITCODE -ne 0) { Err "Failed to push to dev branch." }
-Write-Host "  Pushed to dev branch." -ForegroundColor Green
+Write-Host "  Pushed to dev." -ForegroundColor Green
 
-Log "Merging dev into main and pushing to main..."
+Log "Merging dev -> main and pushing..."
 git checkout main
-git merge dev --no-ff -m "Merge dev into main — initial release"
-git push -u origin main
-if ($LASTEXITCODE -ne 0) { Err "Failed to push to main branch." }
-Write-Host "  Pushed to main branch." -ForegroundColor Green
+git merge dev --no-ff -m "Merge dev into main: initial release"
+git push -u origin main --force
+if ($LASTEXITCODE -ne 0) { Err "Failed to push to main." }
+Write-Host "  Pushed to main." -ForegroundColor Green
 
-# Protect main branch (require PR reviews)
-gh api "repos/$GITHUB_USERNAME/$REPO_NAME/branches/main/protection" `
+& $GH api "repos/$GITHUB_USERNAME/$REPO_NAME/branches/main/protection" `
     --method PUT `
     --field required_status_checks='{"strict":true,"contexts":["Build and Deploy"]}' `
     --field enforce_admins=false `
     --field required_pull_request_reviews='{"required_approving_review_count":1}' `
-    --field restrictions='null' 2>/dev/null
+    --field restrictions='null' 2>$null
 Write-Host "  Branch protection set on main." -ForegroundColor Green
 
 Pop-Location
 
 # ============================================================
-# STEP 4 — Create Azure Resources
+# STEP 4 — Azure resources
 # ============================================================
-Log "Creating Resource Group '$RESOURCE_GROUP' in '$AZURE_LOCATION'..."
-az group create `
-    --name $RESOURCE_GROUP `
-    --location $AZURE_LOCATION `
-    --output none
-Write-Host "  Resource group created." -ForegroundColor Green
+Log "Creating Resource Group '$RESOURCE_GROUP' (skips if already exists)..."
+& $AZ group create --name $RESOURCE_GROUP --location $AZURE_LOCATION --output none 2>$null
+Write-Host "  Resource group ready." -ForegroundColor Green
 
-Log "Creating Azure Static Web App '$APP_NAME'..."
-$SWA_JSON = az staticwebapp create `
+# Reuse existing SWA if one already exists in this resource group
+$EXISTING_SWA = & $AZ staticwebapp list `
+    --resource-group $RESOURCE_GROUP `
+    --query "[0].name" -o tsv 2>$null
+if ($EXISTING_SWA) {
+    $APP_NAME = $EXISTING_SWA
+    Write-Host "  Reusing existing Static Web App: $APP_NAME" -ForegroundColor Green
+} else {
+    Log "Creating Azure Static Web App '$APP_NAME'..."
+    & $AZ staticwebapp create `
+        --name $APP_NAME `
+        --resource-group $RESOURCE_GROUP `
+        --source "https://github.com/$GITHUB_USERNAME/$REPO_NAME" `
+        --location $AZURE_LOCATION `
+        --branch main `
+        --app-location "/" `
+        --output-location "/" `
+        --token $GH_TOKEN `
+        --sku Free `
+        --output json
+    if ($LASTEXITCODE -ne 0) { Err "Failed to create Static Web App." }
+    Write-Host "  Static Web App created." -ForegroundColor Green
+}
+
+$DEPLOY_URL   = & $AZ staticwebapp show `
     --name $APP_NAME `
     --resource-group $RESOURCE_GROUP `
-    --source "https://github.com/$GITHUB_USERNAME/$REPO_NAME" `
-    --location $AZURE_LOCATION `
-    --branch main `
-    --app-location "/" `
-    --output-location "/" `
-    --login-with-github `
-    --sku Free `
-    --output json
-
-if ($LASTEXITCODE -ne 0) { Err "Failed to create Static Web App." }
-
-$SWA = $SWA_JSON | ConvertFrom-Json
-$DEPLOY_URL  = $SWA.defaultHostname
-$DEPLOY_TOKEN = az staticwebapp secrets list `
+    --query defaultHostname -o tsv
+$DEPLOY_TOKEN = & $AZ staticwebapp secrets list `
     --name $APP_NAME `
     --resource-group $RESOURCE_GROUP `
     --query "properties.apiKey" -o tsv
-
-Write-Host "  Static Web App created." -ForegroundColor Green
 Write-Host "  URL: https://$DEPLOY_URL" -ForegroundColor Yellow
 
 # ============================================================
-# STEP 5 — Add deployment token as GitHub secret
+# STEP 5 — Azure Storage Account (strongly consistent, ~$0/month)
 # ============================================================
-Log "Adding AZURE_STATIC_WEB_APPS_API_TOKEN to GitHub secrets..."
-Push-Location $PSScriptRoot
-$DEPLOY_TOKEN | gh secret set AZURE_STATIC_WEB_APPS_API_TOKEN
-if ($LASTEXITCODE -ne 0) { Err "Failed to set GitHub secret." }
-Write-Host "  Secret set." -ForegroundColor Green
-Pop-Location
+$STORAGE_NAME = "stfintracker$(Get-Random -Maximum 9999)"
+Log "Creating Azure Storage Account '$STORAGE_NAME'..."
+& $AZ storage account create `
+    --name $STORAGE_NAME `
+    --resource-group $RESOURCE_GROUP `
+    --location $AZURE_LOCATION `
+    --sku Standard_LRS `
+    --kind StorageV2 `
+    --output none
+if ($LASTEXITCODE -ne 0) { Err "Failed to create Storage Account." }
+Write-Host "  Storage Account created (~\$0/month for this usage)." -ForegroundColor Green
+
+$STORAGE_CONN = & $AZ storage account show-connection-string `
+    --name $STORAGE_NAME `
+    --resource-group $RESOURCE_GROUP `
+    --query connectionString -o tsv
+Write-Host "  Connection string retrieved." -ForegroundColor Green
 
 # ============================================================
-# STEP 6 — Trigger first deployment
+# STEP 6 — Push secrets to GitHub + wire into Static Web App
 # ============================================================
-Log "Triggering initial CI/CD run on main branch..."
-gh workflow run azure-deploy.yml --repo "$GITHUB_USERNAME/$REPO_NAME" --ref main 2>/dev/null
+Log "Adding secrets to GitHub and Static Web App..."
+
+& $GH secret set AZURE_STATIC_WEB_APPS_API_TOKEN `
+    --repo "$GITHUB_USERNAME/$REPO_NAME" `
+    --body $DEPLOY_TOKEN
+& $GH secret set STORAGE_CONNECTION_STRING `
+    --repo "$GITHUB_USERNAME/$REPO_NAME" `
+    --body $STORAGE_CONN
+
+# Wire STORAGE_CONNECTION_STRING as an app setting so Azure Functions can read it
+& $AZ staticwebapp appsettings set `
+    --name $APP_NAME `
+    --resource-group $RESOURCE_GROUP `
+    --setting-names "STORAGE_CONNECTION_STRING=$STORAGE_CONN" `
+    --output none
+Write-Host "  Secrets set (GitHub + Static Web App)." -ForegroundColor Green
+
+# ============================================================
+# STEP 7 — Push updated code (sync.js + api/ + workflow)
+# ============================================================
+Log "Pushing updated code with Cosmos DB integration..."
+Push-Location $PSScriptRoot
+git add sync.js api/ index.html .github/workflows/azure-deploy.yml
+git commit -m "feat: add Azure Cosmos DB cloud sync via Azure Functions" 2>$null
+git push origin main
+Pop-Location
+Write-Host "  Code pushed — CI/CD will redeploy automatically." -ForegroundColor Green
+
+# ============================================================
+# STEP 8 — Trigger CI/CD run
+# ============================================================
+Log "Triggering CI/CD run..."
+& $GH workflow run azure-deploy.yml --repo "$GITHUB_USERNAME/$REPO_NAME" --ref main 2>$null
 Start-Sleep -Seconds 3
-gh run list --repo "$GITHUB_USERNAME/$REPO_NAME" --limit 3
+& $GH run list --repo "$GITHUB_USERNAME/$REPO_NAME" --limit 5
 
 # ============================================================
 # Done
 # ============================================================
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Green
-Write-Host " Deployment Complete!" -ForegroundColor Green
+Write-Host " Deployment Complete!"                   -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Green
-Write-Host " App URL    : https://$DEPLOY_URL"
-Write-Host " GitHub Repo: https://github.com/$GITHUB_USERNAME/$REPO_NAME"
-Write-Host " Azure RG   : $RESOURCE_GROUP"
-Write-Host " App Name   : $APP_NAME"
+Write-Host " App URL     : https://$DEPLOY_URL"
+Write-Host " GitHub Repo : https://github.com/$GITHUB_USERNAME/$REPO_NAME"
+Write-Host " Azure RG    : $RESOURCE_GROUP"
+Write-Host " Storage     : $STORAGE_NAME"
 Write-Host ""
-Write-Host " CI/CD      : Every push to 'dev' or 'main' auto-deploys."
-Write-Host " Next step  : Edit index.html, push to dev, open a PR to main."
+Write-Host " Data is stored in Azure Table Storage."
+Write-Host " Multi-device: share your Sync Code shown in the app (bottom-right)."
+Write-Host " CI/CD: every push to dev or main auto-deploys."
 Write-Host "========================================" -ForegroundColor Green

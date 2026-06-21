@@ -1,18 +1,22 @@
-const { CosmosClient } = require('@azure/cosmos');
+const { TableClient } = require('@azure/data-tables');
 
-let container;
+const TABLE_NAME = 'userdata';
+const PARTITION  = 'u'; // single partition — all users in one table
 
-async function getContainer() {
-  if (container) return container;
-  const client = new CosmosClient(process.env.COSMOS_CONNECTION_STRING);
-  const { database } = await client.databases.createIfNotExists({ id: 'finance-tracker' });
-  const { container: c } = await database.containers.createIfNotExists({
-    id: 'user-data',
-    partitionKey: { paths: ['/userId'] },
-    defaultTtl: -1
-  });
-  container = c;
-  return container;
+let tableClient = null;
+
+async function getClient() {
+  if (tableClient) return tableClient;
+  tableClient = TableClient.fromConnectionString(
+    process.env.STORAGE_CONNECTION_STRING,
+    TABLE_NAME
+  );
+  try {
+    await tableClient.createTable();
+  } catch (e) {
+    if (e.statusCode !== 409) throw e; // 409 = already exists, fine
+  }
+  return tableClient;
 }
 
 function getUserId(req) {
@@ -43,22 +47,22 @@ module.exports = async function (context, req) {
   }
 
   try {
-    const c = await getContainer();
+    const client = await getClient();
 
     if (req.method === 'GET') {
       try {
-        const { resource } = await c.item(userId, userId).read();
+        const entity = await client.getEntity(PARTITION, userId);
         context.res = {
           status: 200,
           headers: HEADERS,
-          body: JSON.stringify(resource ? { store: resource.store, updatedAt: resource.updatedAt } : null)
+          body: JSON.stringify({ store: JSON.parse(entity.store), updatedAt: entity.updatedAt })
         };
       } catch (e) {
-        context.res = {
-          status: e.code === 404 ? 200 : 500,
-          headers: HEADERS,
-          body: e.code === 404 ? JSON.stringify(null) : JSON.stringify({ error: e.message })
-        };
+        if (e.statusCode === 404) {
+          context.res = { status: 200, headers: HEADERS, body: JSON.stringify(null) };
+        } else {
+          throw e;
+        }
       }
 
     } else if (req.method === 'PUT') {
@@ -67,13 +71,18 @@ module.exports = async function (context, req) {
         context.res = { status: 400, headers: HEADERS, body: JSON.stringify({ error: 'store required' }) };
         return;
       }
-      const doc = { id: userId, userId, store, updatedAt: new Date().toISOString() };
-      await c.items.upsert(doc);
-      context.res = { status: 200, headers: HEADERS, body: JSON.stringify({ ok: true, updatedAt: doc.updatedAt }) };
+      const updatedAt = new Date().toISOString();
+      await client.upsertEntity({
+        partitionKey: PARTITION,
+        rowKey: userId,
+        store: JSON.stringify(store),
+        updatedAt
+      }, 'Replace');
+      context.res = { status: 200, headers: HEADERS, body: JSON.stringify({ ok: true, updatedAt }) };
     }
 
   } catch (e) {
-    context.log.error('Error:', e.message);
-    context.res = { status: 500, headers: HEADERS, body: JSON.stringify({ error: 'Internal error' }) };
+    context.log.error('Storage error:', e.message);
+    context.res = { status: 500, headers: HEADERS, body: JSON.stringify({ error: e.message }) };
   }
 };
