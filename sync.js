@@ -169,13 +169,18 @@
     }
 
     if (!payload || !payload.store) {
-      // Still empty after retry — genuinely empty or unreachable.
-      // Only push if we have a confirmed save timestamp (real user data, not seed data).
+      // Still empty after retry. Cosmos consistency lag can exceed 1.5 s across
+      // different Function instances (session consistency doesn't span them).
       if (localRaw && localSavedAt > 0) {
+        // Confirmed local data exists — push it up.
         console.log('[sync] cloud empty after retry — re-pushing local data (savedAt=' + localSavedAt + ')');
         push(localRaw, true);
       } else {
-        console.log('[sync] cloud empty after retry — no confirmed local data, skipping push');
+        // Fresh session: no confirmed local data. Don't push seed data.
+        // Instead, poll in the background so we recover the previous session's
+        // data once Cosmos finishes replicating — without blocking the page load.
+        console.log('[sync] cloud empty after retry — starting background poll (Cosmos lag recovery)');
+        _startCloudPoll();
       }
       return null;
     }
@@ -218,6 +223,48 @@
     }
 
     return null;
+  }
+
+  // ── Background cloud poll (Cosmos lag recovery) ───────────────────────────
+  // Called when the initial checkCloud finds an empty cloud in a fresh Private
+  // session. Cosmos can lag 5-30 s across different Function instances. Rather
+  // than blocking the page, we poll silently and show the banner when data arrives.
+  function _startCloudPoll() {
+    var attempts = 0;
+    var delays = [2000, 3000, 4000, 5000, 5000, 5000, 5000]; // ~29 s total
+    function doPoll() {
+      if (attempts >= delays.length) {
+        console.log('[sync] background poll exhausted — accepting cloud as empty');
+        return;
+      }
+      // Stop polling if local session has now confirmed its own push
+      if (localStorage.getItem(FP_KEY)) {
+        console.log('[sync] background poll cancelled — FP_KEY now set by this session');
+        return;
+      }
+      var delay = delays[attempts++];
+      setTimeout(async function () {
+        if (localStorage.getItem(FP_KEY)) return; // recheck before firing
+        console.log('[sync] background poll attempt ' + attempts);
+        try {
+          var r = await fetch(API);
+          if (!r.ok) { doPoll(); return; }
+          var p;
+          try { p = await r.json(); } catch (e) { doPoll(); return; }
+          if (p && p.store) {
+            console.log('[sync] background poll: found cloud data');
+            var cloudSavedAt = Number(p.store._savedAt) || 0;
+            var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
+            if (cloudSavedAt > localSavedAt) {
+              showUpdateBanner(p.store); // let user choose to load it
+            }
+            return; // stop regardless — we have a definitive answer
+          }
+        } catch (e) {}
+        doPoll();
+      }, delay);
+    }
+    doPoll();
   }
 
   // ── Banner ────────────────────────────────────────────────────────────────
@@ -470,6 +517,14 @@
   // ── Flush helper: push if localStorage differs from confirmed FP_KEY ────────
   function _flushIfNeeded(label) {
     if (!_pushReady) return;
+    // Guard: only flush if this session has a confirmed prior push (FP_KEY set).
+    // FP_KEY is written only after a PUT 200. Without it, localStorage holds only
+    // the app's default seed state (fresh Private session) — flushing that would
+    // overwrite the user's real cloud data from a previous session.
+    if (!localStorage.getItem(FP_KEY)) {
+      console.log('[sync] ' + label + ' flush skipped — no FP_KEY (seed-data guard)');
+      return;
+    }
     try {
       var localRaw = localStorage.getItem(STORE_KEY);
       if (!localRaw) return;
