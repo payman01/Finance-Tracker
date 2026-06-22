@@ -409,6 +409,12 @@
 
   // ── Flush on tab close / hide / periodic ─────────────────────────────────
   window.addEventListener('beforeunload', function (e) {
+    // Fire blur on any focused add-item input so React's onBlur handler runs commitAdd
+    // before the page unloads (handles Cmd+R while the user is still typing).
+    var active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+      try { active.blur(); } catch (_) {}
+    }
     _flushIfNeeded('beforeunload');
     if (_hasUnsavedChanges) { e.preventDefault(); e.returnValue = ''; }
   });
