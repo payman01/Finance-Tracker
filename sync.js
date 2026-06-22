@@ -73,6 +73,43 @@
     return JSON.stringify(c);
   }
 
+  // Returns true if the cloud store should replace local data.
+  //
+  // Old rule: cloud wins if cloudSavedAt > localSavedAt.
+  // Problem: localSavedAt is a client clock — a stale tab that hasn't been
+  // touched in days still gets Date.now() on its next push, and can win
+  // over genuinely newer cloud data.
+  //
+  // New rule:
+  //   1. If local fingerprint == cloud fingerprint → already in sync, no action.
+  //   2. If local is "clean" (fingerprint matches last confirmed sync FP_KEY,
+  //      i.e. the user has made no local changes since the last confirmed push
+  //      or cloud-apply) → cloud always wins regardless of timestamps.
+  //   3. If local has real unsaved changes → timestamps decide.
+  //
+  // This means a stale open tab (fingerprint unchanged = clean) can never
+  // overwrite good cloud data.
+  function _cloudShouldWin(cloudStore) {
+    if (!cloudStore) return false;
+    var cloudFp = _fingerprint(cloudStore);
+    var localRaw = localStorage.getItem(STORE_KEY);
+    var localStore = null;
+    try { if (localRaw) localStore = JSON.parse(localRaw); } catch (e) {}
+    var localFpCurrent = localStore ? _fingerprint(localStore) : null;
+
+    if (localFpCurrent === cloudFp) return false; // already identical — nothing to do
+
+    var localFpStored = localStorage.getItem(FP_KEY);
+    // "clean" = local hasn't changed since last confirmed sync (or never synced)
+    var localIsClean = !localFpStored || localFpStored === localFpCurrent;
+    if (localIsClean) return true; // cloud has different data; local is unmodified → cloud wins
+
+    // Local has real unsaved changes — fall back to timestamps
+    var cloudSavedAt  = Number(cloudStore._savedAt  || 0);
+    var localSavedAt  = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
+    return cloudSavedAt > localSavedAt;
+  }
+
   function _updateBadge(text, color) {
     if (!_badge) return;
     _badge.textContent = text;
@@ -211,25 +248,28 @@
       return;
     }
 
-    var cloudSavedAt = Number(payload.store._savedAt || 0);
-    console.log('[sync] cloudSavedAt=' + cloudSavedAt + ' localSavedAt=' + localSavedAt);
+    var cloudSavedAt  = Number(payload.store._savedAt || 0);
+    var cloudFp       = _fingerprint(payload.store);
+    var localFpStored = localStorage.getItem(FP_KEY);
+    var localStore    = null;
+    try { if (localRaw) localStore = JSON.parse(localRaw); } catch (e) {}
+    var localFpCurrent = localStore ? _fingerprint(localStore) : null;
+    var localIsClean   = !localFpStored || localFpStored === localFpCurrent;
+    console.log('[sync] cloudSavedAt=' + cloudSavedAt + ' localSavedAt=' + localSavedAt
+      + ' localIsClean=' + localIsClean + ' sameContent=' + (localFpCurrent === cloudFp));
 
-    // Cloud wins when:
-    //   a) No FP_KEY — this browser has never confirmed a push (seed or Private session)
-    //   b) Cloud is strictly newer than local
-    if (!hasFP || cloudSavedAt > localSavedAt) {
+    if (_cloudShouldWin(payload.store)) {
       console.log('[sync] cloud wins — applying and reloading');
       _applyCloudData(payload.store);
       location.reload();
       return;
     }
 
-    // Local is newer or same — push local if newer
-    if (localSavedAt > cloudSavedAt) {
-      console.log('[sync] local is newer — pushing up');
-      if (localRaw) push(localRaw, true);
+    if (localFpCurrent === cloudFp) {
+      console.log('[sync] already in sync with cloud');
     } else {
-      console.log('[sync] in sync with cloud');
+      console.log('[sync] local has unsaved changes and is newer — pushing up');
+      if (localRaw) push(localRaw, true);
     }
 
     _pushReady = true;
@@ -311,14 +351,10 @@
         var r = await fetch(API);
         if (!r.ok) throw new Error('HTTP ' + r.status);
         var payload = await r.json();
-        if (payload && payload.store) {
-          var cloudSavedAt = Number(payload.store._savedAt || 0);
-          var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
-          if (cloudSavedAt > localSavedAt) {
-            _applyCloudData(payload.store);
-            location.reload();
-            return;
-          }
+        if (payload && _cloudShouldWin(payload.store)) {
+          _applyCloudData(payload.store);
+          location.reload();
+          return;
         }
         btn.textContent = '☁ Up to date ✓';
       } catch (ex) {
@@ -383,14 +419,10 @@
           var r = await fetch(API);
           if (!r.ok) throw new Error('HTTP ' + r.status);
           var payload = await r.json();
-          if (payload && payload.store) {
-            var cloudSavedAt = Number(payload.store._savedAt || 0);
-            var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
-            if (cloudSavedAt > localSavedAt) {
-              _applyCloudData(payload.store);
-              location.reload();
-              return;
-            }
+          if (payload && _cloudShouldWin(payload.store)) {
+            _applyCloudData(payload.store);
+            location.reload();
+            return;
           }
           badge.textContent = '☁ up to date';
           badge.style.color = '#22c55e';
@@ -436,7 +468,9 @@
         if (!payload || !payload.store) return;
         var cloudSavedAt = Number(payload.store._savedAt || 0);
         var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
-        if (cloudSavedAt > localSavedAt + 2000) {   // 2 s grace to avoid self-notifications
+        // Only notify if cloud is genuinely newer by >2s (grace to avoid self-notifications)
+        // AND would win under the new fingerprint-based logic
+        if (cloudSavedAt > localSavedAt + 2000 && _cloudShouldWin(payload.store)) {
           console.log('[sync] poll: cloud is newer (' + cloudSavedAt + ' > ' + localSavedAt + ') — notifying');
           _updateBadge('☁ update available — click to refresh', '#0F6CBD');
           if (_badge) {
