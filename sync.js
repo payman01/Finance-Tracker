@@ -3,54 +3,69 @@
 
   var API          = '/api/data';
   var STORE_KEY    = 'fintrack_v2';
-  var CHECKED      = 'ft_checked';   // sessionStorage — cloud checked this tab
-  var FP_KEY       = 'ft_sync_fp';   // localStorage — fingerprint written ONLY after successful PUT
-  var SAVED_AT_KEY = 'ft_saved_at';  // localStorage — timestamp, separate from store so app can't strip it
+  var CHECKED      = 'ft_checked';   // sessionStorage — cloud checked this tab session
+  var FP_KEY       = 'ft_sync_fp';   // localStorage — written ONLY after confirmed PUT 200
+  var SAVED_AT_KEY = 'ft_saved_at';  // localStorage — timestamp of last confirmed save
 
-  // ── One-time migration: move _savedAt out of the store into its own key ──
+  // ── Loading overlay ───────────────────────────────────────────────────────
+  // Show immediately so the user never sees seed/default data before cloud loads.
+  // Only created on fresh sessions (not on same-tab reloads where CHECKED is set).
+  var _overlay = null;
+  if (!sessionStorage.getItem(CHECKED)) {
+    try {
+      _overlay = document.createElement('div');
+      _overlay.id = 'ft-loading';
+      _overlay.style.cssText = [
+        'position:fixed;inset:0;z-index:99998',
+        'background:#f3f4f7;display:flex;align-items:center;justify-content:center',
+        'font:13px/1 system-ui,sans-serif;color:#9ca3af'
+      ].join(';');
+      _overlay.textContent = '☁ Loading…';
+      document.documentElement.appendChild(_overlay);
+    } catch (e) { _overlay = null; }
+  }
+
+  function _removeOverlay() {
+    if (!_overlay) return;
+    try { _overlay.remove(); } catch (e) {}
+    _overlay = null;
+  }
+
+  // ── One-time migration: move _savedAt out of store into its own key ───────
   (function migrate() {
     try {
       if (localStorage.getItem(SAVED_AT_KEY)) return;
       var raw = localStorage.getItem(STORE_KEY);
       if (!raw) return;
       var s = JSON.parse(raw);
-      if (s && s._savedAt) {
-        localStorage.setItem(SAVED_AT_KEY, String(s._savedAt));
-      }
+      if (s && s._savedAt) localStorage.setItem(SAVED_AT_KEY, String(s._savedAt));
     } catch (e) {}
   })();
 
-  // Block pushes until cloud check completes on new sessions.
-  var _pushReady = !!sessionStorage.getItem(CHECKED);
-
-  // In-memory fingerprint of last content we TRIED to push.
-  // Only persisted to FP_KEY after a successful PUT response.
+  // _pushReady: true on same-tab reloads (CHECKED in sessionStorage), false otherwise
+  var _pushReady   = !!sessionStorage.getItem(CHECKED);
   var _lastPushedFp = (function () {
     try { return localStorage.getItem(FP_KEY) || null; } catch (e) { return null; }
   })();
+  var _badge              = null;
+  var _hasUnsavedChanges  = false;
 
-  var _badge = null;              // DOM node reference for live badge updates
-  var _hasUnsavedChanges = false; // true between push() start and PUT 200
+  // ── Start cloud fetch IMMEDIATELY (before DOMContentLoaded) ──────────────
+  // Table Storage round-trips take ~100–200 ms. Starting here gives the fetch
+  // time to complete before the Babel-compiled React scripts finish initialising.
+  // On same-tab reloads the cloud was already checked, so skip the fetch.
+  var _cloudFetch = sessionStorage.getItem(CHECKED)
+    ? null
+    : (function () {
+        try {
+          return fetch(API)
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .catch(function ()  { return null; });
+        } catch (e) { return Promise.resolve(null); }
+      })();
 
-  // ── Startup diagnostics ────────────────────────────────────────────────────
-  (function diagStartup() {
-    try {
-      var raw = localStorage.getItem(STORE_KEY);
-      var fp  = localStorage.getItem(FP_KEY);
-      var confirmed = fp ? 'fp:' + fp.slice(0, 16) + '...' : 'null';
-      if (raw) {
-        var s = JSON.parse(raw);
-        var items = [].concat(
-          ((s.categories || {}).expenses || []).reduce(function(a,c){ return a.concat(c.items||[]); }, []),
-          ((s.categories || {}).income  || []).reduce(function(a,c){ return a.concat(c.items||[]); }, [])
-        );
-        console.log('[sync] startup: localStorage has ' + items.length + ' items, FP_KEY=' + confirmed);
-        console.log('[sync] startup: items=[' + items.map(function(i){return i.name;}).join(', ') + ']');
-      } else {
-        console.log('[sync] startup: localStorage empty, FP_KEY=' + confirmed);
-      }
-    } catch (e) {}
-  })();
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  var _set = Storage.prototype.setItem;
 
   function _fingerprint(store) {
     var c = Object.assign({}, store);
@@ -64,8 +79,7 @@
     _badge.style.color = color || '#9ca3af';
   }
 
-  // ── Patch localStorage.setItem immediately ────────────────────────────────
-  var _set = Storage.prototype.setItem;
+  // ── Patch localStorage.setItem to auto-push on app writes ────────────────
   Storage.prototype.setItem = function (key, value) {
     _set.call(this, key, value);
     if (this === localStorage && key === STORE_KEY && _pushReady) {
@@ -73,51 +87,7 @@
     }
   };
 
-  // Push store to cloud.
-  // FP_KEY is written ONLY after a successful PUT so a failed push can be retried.
-  function push(storeJson, force) {
-    try {
-      var store = JSON.parse(storeJson);
-      if (!store) return;
-      var fp = _fingerprint(store);
-      if (!force && _lastPushedFp !== null && fp === _lastPushedFp) {
-        console.log('[sync] content unchanged — skipping push');
-        return;
-      }
-      _lastPushedFp = fp; // optimistically block duplicates in-flight
-      _hasUnsavedChanges = true;
-      _updateBadge('☁ saving…', '#f59e0b'); // amber while in-flight
-      var savedAt = Date.now();
-      try { _set.call(localStorage, SAVED_AT_KEY, String(savedAt)); } catch (e) {}
-      var cloudPayload = Object.assign({}, store, { _savedAt: savedAt });
-      console.log('[sync] push → PUT /api/data  savedAt=' + savedAt);
-      fetch(API, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ store: cloudPayload }),
-        keepalive: true  // survives tab close / refresh so data reaches Cosmos
-      }).then(function (r) {
-        if (r.ok) {
-          // Only persist fingerprint after confirmed cloud write
-          try { _set.call(localStorage, FP_KEY, fp); } catch (e) {}
-          _hasUnsavedChanges = false;
-          var d = new Date();
-          _updateBadge('☁ saved ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), '#22c55e');
-          console.log('[sync] PUT 200 ✓');
-        } else {
-          _lastPushedFp = null; // allow retry
-          _updateBadge('⚠ save failed — will retry', '#ef4444');
-          console.error('[sync] PUT failed status:', r.status);
-        }
-      }).catch(function (e) {
-        _lastPushedFp = null; // allow retry on network error
-        _updateBadge('⚠ offline — will retry', '#9ca3af');
-        console.error('[sync] PUT network error:', e.message);
-      });
-    } catch (e) { console.error('[sync] push error:', e); }
-  }
-
-  // Write cloud data to localStorage; strip _savedAt from store so app state stays clean.
+  // ── Apply cloud data to localStorage ─────────────────────────────────────
   function _applyCloudData(cloudStore) {
     var cloudSavedAt = cloudStore._savedAt || Date.now();
     var storeOnly = Object.assign({}, cloudStore);
@@ -130,190 +100,137 @@
     console.log('[sync] cloud data applied, savedAt=' + cloudSavedAt);
   }
 
-  // ── Check cloud ───────────────────────────────────────────────────────────
-  async function checkCloud(force) {
-    if (!force && sessionStorage.getItem(CHECKED)) return null;
+  // ── Push store to cloud ───────────────────────────────────────────────────
+  function push(storeJson, force) {
+    try {
+      var store = JSON.parse(storeJson);
+      if (!store) return;
+      var fp = _fingerprint(store);
+      if (!force && _lastPushedFp !== null && fp === _lastPushedFp) return;
+      _lastPushedFp = fp;
+      _hasUnsavedChanges = true;
+      _updateBadge('☁ saving…', '#f59e0b');
+      var savedAt = Date.now();
+      try { _set.call(localStorage, SAVED_AT_KEY, String(savedAt)); } catch (e) {}
+      var cloudPayload = Object.assign({}, store, { _savedAt: savedAt });
+      console.log('[sync] push → PUT /api/data  savedAt=' + savedAt);
+      fetch(API, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ store: cloudPayload }),
+        keepalive: true
+      }).then(function (r) {
+        if (r.ok) {
+          try { _set.call(localStorage, FP_KEY, fp); } catch (e) {}
+          _hasUnsavedChanges = false;
+          var d = new Date();
+          _updateBadge('☁ saved ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), '#22c55e');
+          console.log('[sync] PUT 200 ✓');
+        } else {
+          _lastPushedFp = null;
+          _updateBadge('⚠ save failed — will retry', '#ef4444');
+          console.error('[sync] PUT failed:', r.status);
+        }
+      }).catch(function (e) {
+        _lastPushedFp = null;
+        _updateBadge('⚠ offline — will retry', '#9ca3af');
+        console.error('[sync] PUT error:', e.message);
+      });
+    } catch (e) { console.error('[sync] push error:', e); }
+  }
+
+  // ── Flush helper: push on tab hide / beforeunload / periodic ─────────────
+  function _flushIfNeeded(label) {
+    if (!_pushReady) return;
+    if (!localStorage.getItem(FP_KEY)) {
+      console.log('[sync] ' + label + ' flush skipped — no FP_KEY');
+      return;
+    }
+    try {
+      var localRaw = localStorage.getItem(STORE_KEY);
+      if (!localRaw) return;
+      var store = JSON.parse(localRaw);
+      if (!store) return;
+      var fp = _fingerprint(store);
+      if (fp === localStorage.getItem(FP_KEY)) return;
+      var savedAt = Date.now();
+      _set.call(localStorage, SAVED_AT_KEY, String(savedAt));
+      var cloudPayload = Object.assign({}, store, { _savedAt: savedAt });
+      console.log('[sync] ' + label + ' flush — keepalive PUT');
+      fetch(API, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ store: cloudPayload }),
+        keepalive: true
+      }).then(function (r) {
+        if (r.ok) try { _set.call(localStorage, FP_KEY, fp); } catch (e) {}
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
+  // ── DOMContentLoaded — main sync logic ───────────────────────────────────
+  document.addEventListener('DOMContentLoaded', async function () {
+
+    // Same-tab reload: cloud was already checked this session. Just enable pushes.
+    if (_cloudFetch === null) {
+      _pushReady = true;
+      console.log('[sync] same-tab reload — skipping cloud check, _pushReady=true');
+      setTimeout(renderBadge, 600);
+      return;
+    }
+
+    // Await the prefetch (probably already in-flight or done)
+    var payload = await _cloudFetch;
     sessionStorage.setItem(CHECKED, '1');
 
-    var res;
-    try { res = await fetch(API); } catch (e) {
-      return { error: 'Network error: ' + e.message };
-    }
-
-    if (res.status === 401) return 'unauthed';
-    if (!res.ok) {
-      var body = '';
-      try { body = await res.text(); } catch (e) {}
-      return { error: 'API error ' + res.status + (body ? ': ' + body.slice(0, 120) : '') };
-    }
-
-    var payload;
-    try { payload = await res.json(); } catch (e) {
-      return { error: 'API returned non-JSON (functions may not be deployed yet)' };
-    }
-
+    var localRaw     = localStorage.getItem(STORE_KEY);
     var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
-    var localRaw = localStorage.getItem(STORE_KEY);
-    console.log('[sync] checkCloud: localSavedAt=' + localSavedAt + ' localRaw=' + (localRaw ? 'yes' : 'null'));
+    var hasFP        = !!localStorage.getItem(FP_KEY);
+
+    console.log('[sync] checkCloud: payload=' + (payload ? 'yes' : 'null') +
+                ' localSavedAt=' + localSavedAt + ' hasFP=' + hasFP);
 
     if (!payload || !payload.store) {
-      // Cloud appears empty. This can be Cosmos eventual-consistency lag: the previous
-      // session's keepalive PUT landed in Cosmos but hasn't replicated yet when this
-      // GET fires. Wait 1.5 s and retry once before concluding the cloud is truly empty.
-      console.log('[sync] cloud appears empty — waiting 1.5 s for Cosmos consistency…');
-      await new Promise(function (r) { setTimeout(r, 1500); });
-      try {
-        var r2 = await fetch(API);
-        if (r2.ok) { try { payload = await r2.json(); } catch (e) {} }
-      } catch (e) {}
-    }
-
-    if (!payload || !payload.store) {
-      // Still empty after retry. Cosmos consistency lag can exceed 1.5 s across
-      // different Function instances (session consistency doesn't span them).
+      // Cloud empty or unreachable. Use local data and enable pushes.
+      _pushReady = true;
+      _removeOverlay();
       if (localRaw && localSavedAt > 0) {
-        // Confirmed local data exists — push it up.
-        console.log('[sync] cloud empty after retry — re-pushing local data (savedAt=' + localSavedAt + ')');
+        console.log('[sync] cloud empty — re-pushing local data');
         push(localRaw, true);
       } else {
-        // Fresh session: no confirmed local data. Don't push seed data.
-        // Instead, poll in the background so we recover the previous session's
-        // data once Cosmos finishes replicating — without blocking the page load.
-        console.log('[sync] cloud empty after retry — starting background poll (Cosmos lag recovery)');
-        _startCloudPoll();
+        console.log('[sync] cloud empty, no confirmed local — starting fresh');
       }
-      return null;
+      setTimeout(renderBadge, 600);
+      return;
     }
 
-    var cloudSavedAt = Number(payload.store._savedAt) || 0;
-    console.log('[sync] cloudSavedAt=' + cloudSavedAt + '  localSavedAt=' + localSavedAt);
+    var cloudSavedAt = Number(payload.store._savedAt || 0);
+    console.log('[sync] cloudSavedAt=' + cloudSavedAt + ' localSavedAt=' + localSavedAt);
 
-    if (localSavedAt === 0) {
-      if (!localRaw || !localStorage.getItem(FP_KEY)) {
-        // No confirmed save from this browser (FP_KEY is only written after PUT 200).
-        // Local content is either empty or app-initialised seed data — cloud wins.
-        // This covers every new Private session: no banner, data just loads.
-        console.log('[sync] localSavedAt=0, no FP_KEY — silently loading cloud data');
-        _applyCloudData(payload.store);
-        return { silentReload: true };
-      }
-      // FP_KEY is set but SAVED_AT_KEY was lost. Compare content so we don't
-      // silently discard data the user typed between app init and checkCloud.
-      try {
-        var localFp = _fingerprint(JSON.parse(localRaw));
-        var cloudFp = _fingerprint(payload.store);
-        if (localFp === cloudFp) {
-          console.log('[sync] same content as cloud — syncing metadata silently');
-          _applyCloudData(payload.store);
-          return { silentReload: true };
-        }
-      } catch (e) {}
-      console.log('[sync] local content differs from cloud (no timestamp) — showing banner');
-      return { newerStore: payload.store };
+    // Cloud wins when:
+    //   a) No FP_KEY — this browser has never confirmed a push (seed or Private session)
+    //   b) Cloud is strictly newer than local
+    if (!hasFP || cloudSavedAt > localSavedAt) {
+      console.log('[sync] cloud wins — applying and reloading');
+      _applyCloudData(payload.store);
+      location.reload();
+      return;
     }
 
-    if (cloudSavedAt > localSavedAt) {
-      console.log('[sync] cloud is newer — showing banner');
-      return { newerStore: payload.store };
-    }
-
+    // Local is newer or same — push local if newer
     if (localSavedAt > cloudSavedAt) {
       console.log('[sync] local is newer — pushing up');
       if (localRaw) push(localRaw, true);
+    } else {
+      console.log('[sync] in sync with cloud');
     }
 
-    return null;
-  }
+    _pushReady = true;
+    _removeOverlay();
+    setTimeout(renderBadge, 600);
+  });
 
-  // ── Background cloud poll (Cosmos lag recovery) ───────────────────────────
-  // Called when the initial checkCloud finds an empty cloud in a fresh Private
-  // session. Cosmos can lag 5-30 s across different Function instances. Rather
-  // than blocking the page, we poll silently and show the banner when data arrives.
-  function _startCloudPoll() {
-    var attempts = 0;
-    var delays = [2000, 3000, 4000, 5000, 5000, 5000, 5000]; // ~29 s total
-    function doPoll() {
-      if (attempts >= delays.length) {
-        console.log('[sync] background poll exhausted — accepting cloud as empty');
-        return;
-      }
-      // Stop polling if local session has now confirmed its own push
-      if (localStorage.getItem(FP_KEY)) {
-        console.log('[sync] background poll cancelled — FP_KEY now set by this session');
-        return;
-      }
-      var delay = delays[attempts++];
-      setTimeout(async function () {
-        if (localStorage.getItem(FP_KEY)) return; // recheck before firing
-        console.log('[sync] background poll attempt ' + attempts);
-        try {
-          var r = await fetch(API);
-          if (!r.ok) { doPoll(); return; }
-          var p;
-          try { p = await r.json(); } catch (e) { doPoll(); return; }
-          if (p && p.store) {
-            console.log('[sync] background poll: found cloud data');
-            var cloudSavedAt = Number(p.store._savedAt) || 0;
-            var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
-            if (cloudSavedAt > localSavedAt) {
-              showUpdateBanner(p.store); // let user choose to load it
-            }
-            return; // stop regardless — we have a definitive answer
-          }
-        } catch (e) {}
-        doPoll();
-      }, delay);
-    }
-    doPoll();
-  }
-
-  // ── Banner ────────────────────────────────────────────────────────────────
-  function showUpdateBanner(cloudStore) {
-    if (document.getElementById('ft-sync-bar')) return;
-    var bar = document.createElement('div');
-    bar.id  = 'ft-sync-bar';
-    bar.style.cssText = [
-      'position:fixed;top:0;left:0;right:0;z-index:99999',
-      'background:#0F6CBD;color:#fff',
-      'padding:10px 16px;display:flex;align-items:center;justify-content:space-between',
-      'font:13px/1.4 system-ui,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.25)',
-      'gap:12px'
-    ].join(';');
-    bar.innerHTML = [
-      '<span>☁&nbsp; Newer data is available from another device.</span>',
-      '<div style="display:flex;gap:8px;flex-shrink:0">',
-        '<button id="ft-load" style="background:#fff;color:#0F6CBD;border:none;',
-          'padding:5px 14px;border-radius:6px;font:600 13px system-ui;cursor:pointer">',
-          'Load latest</button>',
-        '<button id="ft-keep" style="background:transparent;color:rgba(255,255,255,.85);',
-          'border:1px solid rgba(255,255,255,.5);padding:5px 14px;border-radius:6px;',
-          'font:13px system-ui;cursor:pointer">',
-          'Keep my changes</button>',
-      '</div>'
-    ].join('');
-    document.body.prepend(bar);
-
-    document.getElementById('ft-load').onclick = function () {
-      _applyCloudData(cloudStore);
-      location.reload();
-    };
-    document.getElementById('ft-keep').onclick = function () {
-      bar.remove();
-      _pushReady = true;
-      console.log('[sync] user kept local changes — _pushReady = true');
-      // Only push if this browser has a confirmed save timestamp.
-      // A fresh Private session has localSavedAt = 0, meaning the "local data" is
-      // just the app's default seed state. Pushing it would overwrite real cloud data.
-      if (localStorage.getItem(SAVED_AT_KEY)) {
-        var localRaw = localStorage.getItem(STORE_KEY);
-        if (localRaw) push(localRaw, true);
-      } else {
-        console.log('[sync] fresh session — not pushing seed data on Keep; cloud data preserved');
-      }
-    };
-  }
-
-  // ── User profile panel ────────────────────────────────────────────────────
+  // ── Profile panel ─────────────────────────────────────────────────────────
   function renderProfile(user) {
     if (document.getElementById('ft-profile-btn')) return;
 
@@ -371,37 +288,43 @@
         'Sign out',
       '</a>',
     ].join('');
-
     document.body.appendChild(panel);
 
     btn.onclick = function (e) {
       e.stopPropagation();
       panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
     };
-    document.addEventListener('click', function () {
-      panel.style.display = 'none';
-    });
+    document.addEventListener('click', function () { panel.style.display = 'none'; });
 
     document.getElementById('ft-sync-now').onclick = async function (e) {
       e.stopPropagation();
-      this.textContent = '☁ Checking…';
-      var result = await checkCloud(true);
-      if (result && result.newerStore) {
-        showUpdateBanner(result.newerStore);
-        this.textContent = '☁ Update ready — see banner';
-      } else if (result && result.error) {
-        this.textContent = '⚠ ' + result.error.slice(0, 40);
-      } else {
-        this.textContent = '☁ Up to date ✓';
-        setTimeout(function () {
-          var b = document.getElementById('ft-sync-now');
-          if (b) b.textContent = '☁ Sync now';
-        }, 2000);
+      var btn = this;
+      btn.textContent = '☁ Checking…';
+      try {
+        var r = await fetch(API);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        var payload = await r.json();
+        if (payload && payload.store) {
+          var cloudSavedAt = Number(payload.store._savedAt || 0);
+          var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
+          if (cloudSavedAt > localSavedAt) {
+            _applyCloudData(payload.store);
+            location.reload();
+            return;
+          }
+        }
+        btn.textContent = '☁ Up to date ✓';
+      } catch (ex) {
+        btn.textContent = '⚠ ' + ex.message.slice(0, 30);
       }
+      setTimeout(function () {
+        var b = document.getElementById('ft-sync-now');
+        if (b) b.textContent = '☁ Sync now';
+      }, 2000);
     };
   }
 
-  // ── Status badge (bottom-right) ───────────────────────────────────────────
+  // ── Status badge ──────────────────────────────────────────────────────────
   async function renderBadge() {
     var badge = document.createElement('div');
     badge.style.cssText = [
@@ -413,7 +336,7 @@
     badge.textContent = '☁ connecting…';
     badge.style.color = '#9ca3af';
     document.body.appendChild(badge);
-    _badge = badge; // expose for real-time updates from push()
+    _badge = badge;
 
     try {
       var meRes  = await fetch('/.auth/me');
@@ -426,10 +349,8 @@
         badge.style.color  = '#ef4444';
         badge.style.cursor = 'pointer';
         badge.style.border = '1px solid #fca5a5';
-        badge.title = 'Tap to sign in with your Microsoft account';
         badge.onclick = function () {
-          location.href = '/.auth/login/aad?post_login_redirect_uri='
-            + encodeURIComponent(location.pathname);
+          location.href = '/.auth/login/aad?post_login_redirect_uri=' + encodeURIComponent(location.pathname);
         };
         return;
       }
@@ -441,33 +362,35 @@
         var d = new Date(savedAt);
         badge.textContent = '☁ saved ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         badge.style.color = '#22c55e';
-        badge.title = 'Last saved: ' + d.toLocaleString() + '\nTap to sync now';
+        badge.title = 'Last saved: ' + d.toLocaleString();
       } else {
         badge.textContent = '☁ signed in';
         badge.style.color = '#22c55e';
-        badge.title = 'Tap to sync';
       }
 
       badge.style.cursor = 'pointer';
       badge.onclick = async function () {
         badge.textContent = '☁ checking…';
         badge.style.color = '#9ca3af';
-        var result = await checkCloud(true);
-        if (result && result.newerStore) {
-          showUpdateBanner(result.newerStore);
-          badge.textContent = '☁ update ready';
-          badge.style.color = '#f59e0b';
-        } else if (result && result.error) {
-          badge.textContent = '☁ error';
-          badge.style.color = '#ef4444';
-          badge.title = result.error;
-          console.error('[sync]', result.error);
-        } else if (result === 'unauthed') {
-          badge.textContent = '☁ Sign in';
-          badge.style.color = '#ef4444';
-        } else {
+        try {
+          var r = await fetch(API);
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          var payload = await r.json();
+          if (payload && payload.store) {
+            var cloudSavedAt = Number(payload.store._savedAt || 0);
+            var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
+            if (cloudSavedAt > localSavedAt) {
+              _applyCloudData(payload.store);
+              location.reload();
+              return;
+            }
+          }
           badge.textContent = '☁ up to date';
           badge.style.color = '#22c55e';
+        } catch (ex) {
+          badge.textContent = '⚠ error';
+          badge.style.color = '#ef4444';
+          badge.title = ex.message;
         }
       };
 
@@ -477,97 +400,16 @@
     }
   }
 
-  // ── Init ──────────────────────────────────────────────────────────────────
-  document.addEventListener('DOMContentLoaded', async function () {
-    var result = await checkCloud();
-
-    if (result === 'unauthed') {
-      _pushReady = true;
-      console.log('[sync] _pushReady = true (unauthed)');
-    } else if (result && result.silentReload) {
-      location.reload();
-      return;
-    } else if (result && result.newerStore) {
-      // Cloud has newer data — show banner but do NOT enable pushes yet and do NOT
-      // force-push seed data. Banner handlers set _pushReady when conflict is resolved.
-      showUpdateBanner(result.newerStore);
-      console.log('[sync] banner shown — _pushReady stays false until user resolves conflict');
-    } else {
-      // Cloud empty, up to date, or API error — safe to enable pushes.
-      _pushReady = true;
-      console.log('[sync] _pushReady = true');
-      // Force push only when SAVED_AT_KEY is missing AND FP_KEY exists.
-      // FP_KEY is only set after a confirmed PUT 200, so its presence proves
-      // this is real user data, not seed data from a fresh Private session.
-      // Without this guard, a new Private tab whose GET fires before Cosmos
-      // processes the previous session's keepalive PUT would push blank seed
-      // data to cloud, overwriting the real data.
-      if (!localStorage.getItem(SAVED_AT_KEY) && localStorage.getItem(FP_KEY)) {
-        var pendingRaw = localStorage.getItem(STORE_KEY);
-        if (pendingRaw) {
-          console.log('[sync] SAVED_AT_KEY missing but FP_KEY set — force-pushing real data');
-          push(pendingRaw, true);
-        }
-      }
-    }
-
-    setTimeout(renderBadge, 600);
-  });
-
-  // ── Flush helper: push if localStorage differs from confirmed FP_KEY ────────
-  function _flushIfNeeded(label) {
-    if (!_pushReady) return;
-    // Guard: only flush if this session has a confirmed prior push (FP_KEY set).
-    // FP_KEY is written only after a PUT 200. Without it, localStorage holds only
-    // the app's default seed state (fresh Private session) — flushing that would
-    // overwrite the user's real cloud data from a previous session.
-    if (!localStorage.getItem(FP_KEY)) {
-      console.log('[sync] ' + label + ' flush skipped — no FP_KEY (seed-data guard)');
-      return;
-    }
-    try {
-      var localRaw = localStorage.getItem(STORE_KEY);
-      if (!localRaw) return;
-      var store = JSON.parse(localRaw);
-      if (!store) return;
-      var fp = _fingerprint(store);
-      var confirmedFp = localStorage.getItem(FP_KEY);
-      if (fp === confirmedFp) return;
-      var savedAt = Date.now();
-      _set.call(localStorage, SAVED_AT_KEY, String(savedAt));
-      var cloudPayload = Object.assign({}, store, { _savedAt: savedAt });
-      console.log('[sync] ' + label + ' flush — keepalive PUT');
-      fetch(API, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ store: cloudPayload }),
-        keepalive: true
-      }).then(function(r) {
-        if (r.ok) {
-          try { _set.call(localStorage, FP_KEY, fp); } catch (e) {}
-          console.log('[sync] ' + label + ' flush PUT 200 ✓');
-        }
-      }).catch(function() {});
-    } catch (e) {}
-  }
-
-  // ── Flush on page unload (keepalive survives the refresh) ────────────────
+  // ── Flush on tab close / hide / periodic ─────────────────────────────────
   window.addEventListener('beforeunload', function (e) {
     _flushIfNeeded('beforeunload');
-    // If a PUT is still in-flight, show the browser's generic
-    // "Leave site? Changes may not be saved." dialog. This buys an extra
-    // second for the keepalive request to reach Cosmos before the tab closes.
-    if (_hasUnsavedChanges) {
-      e.preventDefault();
-      e.returnValue = '';
-    }
+    if (_hasUnsavedChanges) { e.preventDefault(); e.returnValue = ''; }
   });
 
-  // ── Flush when tab is hidden (fires earlier than beforeunload) ────────────
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState === 'hidden') _flushIfNeeded('visibilitychange');
   });
 
-  // ── Periodic flush every 30 s — catches any push that failed silently ────
   setInterval(function () { _flushIfNeeded('interval'); }, 30000);
+
 })();
