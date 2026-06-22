@@ -425,4 +425,34 @@
 
   setInterval(function () { _flushIfNeeded('interval'); }, 30000);
 
+  // ── Diagnostic: log what Dashboard/Compare compute after app initialises ──
+  setTimeout(function () {
+    try {
+      if (!window.deriveView || !window.compute) {
+        console.warn('[sync] diag: window.deriveView/compute missing — app scripts may not have loaded');
+        return;
+      }
+      var raw = localStorage.getItem(STORE_KEY);
+      if (!raw) { console.warn('[sync] diag: no store in localStorage'); return; }
+      var st = JSON.parse(raw);
+      if (!st || !st.currentMonth) { console.warn('[sync] diag: store has no currentMonth'); return; }
+      var mk = localStorage.getItem('ft_month_v2') || st.currentMonth;
+      var amtNow = (st.amounts || {})[mk] || {};
+      var v = window.deriveView(st, mk);
+      var c = window.compute(v);
+      console.log('[sync] diag month=' + mk
+        + ' amtKeys=' + Object.keys(amtNow).length
+        + ' incomeNow=' + c.incomeNow.toFixed(0)
+        + ' expenseNow=' + c.expenseNow.toFixed(0)
+        + ' net=' + c.net.toFixed(0)
+        + ' expense_cats=' + v.expenses.length
+        + ' income_cats=' + v.income.length
+        + ' deltas=' + c.deltas.length);
+      (st.months || []).forEach(function (m) {
+        var keys = Object.keys((st.amounts || {})[m] || {}).length;
+        console.log('[sync] diag   ' + m + ': ' + keys + ' amount entries');
+      });
+    } catch (e) { console.error('[sync] diag error:', e.message); }
+  }, 3000);
+
 })();
