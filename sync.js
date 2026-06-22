@@ -282,7 +282,7 @@
         'font:600 12px system-ui;cursor:pointer">',
         '☁ Sync now',
       '</button>',
-      '<a href="/.auth/logout?post_logout_redirect_uri=/" style="display:block;text-align:center;',
+      '<a href="/.auth/logout?post_logout_redirect_uri=/signed-out" style="display:block;text-align:center;',
         'padding:7px;background:#fef2f2;color:#dc2626;border:1px solid #fecaca;border-radius:7px;',
         'font:600 12px system-ui;text-decoration:none">',
         'Sign out',

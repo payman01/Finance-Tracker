@@ -25,6 +25,8 @@ function getUserId(req) {
   try {
     const decoded = Buffer.from(header, 'base64').toString('utf8');
     const principal = JSON.parse(decoded);
+    const email = (principal.userDetails || '').toLowerCase();
+    if (!email.endsWith('@officemasters.ca')) return null;
     return principal.userId || null;
   } catch { return null; }
 }
