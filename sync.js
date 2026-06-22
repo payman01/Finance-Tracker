@@ -120,17 +120,24 @@
         body: JSON.stringify({ store: cloudPayload }),
         keepalive: true
       }).then(function (r) {
-        if (r.ok) {
-          try { _set.call(localStorage, FP_KEY, fp); } catch (e) {}
-          _hasUnsavedChanges = false;
-          var d = new Date();
-          _updateBadge('☁ saved ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), '#22c55e');
-          console.log('[sync] PUT 200 ✓');
-        } else {
+        return r.json().then(function (body) {
+          if (r.ok && body && body.ok) {
+            try { _set.call(localStorage, FP_KEY, fp); } catch (e) {}
+            _hasUnsavedChanges = false;
+            var d = new Date();
+            _updateBadge('☁ saved ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), '#22c55e');
+            console.log('[sync] PUT 200 ✓');
+          } else {
+            _lastPushedFp = null;
+            _updateBadge('⚠ save failed — will retry', '#ef4444');
+            console.error('[sync] PUT unexpected response:', r.status, body);
+          }
+        }).catch(function () {
+          // Response wasn't JSON (e.g. a redirect to the login page returned HTML)
           _lastPushedFp = null;
           _updateBadge('⚠ save failed — will retry', '#ef4444');
-          console.error('[sync] PUT failed:', r.status);
-        }
+          console.error('[sync] PUT non-JSON response (auth issue?), status:', r.status);
+        });
       }).catch(function (e) {
         _lastPushedFp = null;
         _updateBadge('⚠ offline — will retry', '#9ca3af');
