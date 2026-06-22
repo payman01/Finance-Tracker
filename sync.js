@@ -425,6 +425,32 @@
 
   setInterval(function () { _flushIfNeeded('interval'); }, 30000);
 
+  // ── Poll cloud every 60 s for updates from other devices ─────────────────
+  // If a newer version exists, flash the badge so the user can click to refresh.
+  setInterval(function () {
+    if (!_pushReady) return;           // still in initial cloud-check phase
+    if (document.hidden) return;       // don't poll while tab is hidden
+    fetch(API)
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (payload) {
+        if (!payload || !payload.store) return;
+        var cloudSavedAt = Number(payload.store._savedAt || 0);
+        var localSavedAt = Number(localStorage.getItem(SAVED_AT_KEY) || 0);
+        if (cloudSavedAt > localSavedAt + 2000) {   // 2 s grace to avoid self-notifications
+          console.log('[sync] poll: cloud is newer (' + cloudSavedAt + ' > ' + localSavedAt + ') — notifying');
+          _updateBadge('☁ update available — click to refresh', '#0F6CBD');
+          if (_badge) {
+            _badge.style.cursor = 'pointer';
+            _badge.onclick = function () {
+              _applyCloudData(payload.store);
+              location.reload();
+            };
+          }
+        }
+      })
+      .catch(function () {}); // silent on error
+  }, 60000);
+
   // ── Diagnostic: log what Dashboard/Compare compute after app initialises ──
   setTimeout(function () {
     try {
